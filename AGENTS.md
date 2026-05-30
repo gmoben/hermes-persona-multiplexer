@@ -52,9 +52,9 @@ account. See [README.md](README.md) for the user‑facing description.
 ├── examples/config.yaml
 ├── plugin.yaml         # kind: platform manifest (version = source of truth)
 ├── docs/spike.md       # the two-account validation plan
-├── cliff.toml          # git-cliff (sole CHANGELOG writer)
 ├── release-please-config.json + .release-please-manifest.json
-└── .github/workflows/  # ci.yml (lint+test), release.yml (release-please + git-cliff)
+└── .github/            # workflows/ (ci.yml lint+test, release.yml release-please),
+                        #   dependabot.yml, pull_request_template.md
 ```
 
 ## Build / Test / Verify
@@ -83,9 +83,11 @@ New behavior → put the *decision* in `routing.py` (with a test), the *I/O* in
 
 ## Versioning & Releases
 
-SemVer; **release-please** owns version/tag/release + version sync, **git-cliff**
-is the sole `CHANGELOG.md` writer. Full rules and the Hermes‑compatibility
-recording requirement are in [RELEASING.md](RELEASING.md).
+SemVer; **release-please** owns the whole flow — version, tag, GitHub Release,
+`CHANGELOG.md`, and version sync into `plugin.yaml` / `pyproject.toml` /
+`discord_personas/__init__.py`. You don't bump versions or edit the changelog by
+hand; just write Conventional Commits and merge the release PR. Full rules and the
+Hermes‑compatibility recording requirement are in [RELEASING.md](RELEASING.md).
 
 ## Commit Messages
 

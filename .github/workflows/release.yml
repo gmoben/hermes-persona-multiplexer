@@ -1,51 +1,25 @@
 name: Release
 
-# Division of labor (see RELEASING.md):
-#   - release-please: version decision (SemVer from Conventional Commits),
-#     release PR, git tag, GitHub Release, and version sync into plugin.yaml /
-#     pyproject.toml / __init__.py via extra-files.
-#   - git-cliff: the authoritative CHANGELOG.md writer + release-notes body,
-#     regenerated when a tag/release is published.
+# release-please owns the entire release flow: it derives the next SemVer from
+# Conventional Commits, opens/maintains a release PR, and on merge it tags the
+# release, creates the GitHub Release, updates CHANGELOG.md, and syncs the version
+# into plugin.yaml / pyproject.toml / discord_personas/__init__.py (extra-files).
+# See RELEASING.md.
 
 on:
   push:
     branches: [main]
-  release:
-    types: [published]
 
 permissions:
   contents: write
   pull-requests: write
+  issues: write
 
 jobs:
-  # Opens/maintains the release PR and, on merge, creates the tag + GitHub Release.
   release-please:
-    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: googleapis/release-please-action@v4
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
-
-  # On a published release, regenerate the changelog from commits (git-cliff is
-  # the sole writer) and refresh the release body.
-  changelog:
-    if: github.event_name == 'release'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Generate CHANGELOG.md with git-cliff
-        uses: orhun/git-cliff-action@v4
-        with:
-          config: cliff.toml
-          args: --tag ${{ github.event.release.tag_name }} --output CHANGELOG.md
-      - name: Generate release notes (latest only)
-        uses: orhun/git-cliff-action@v4
-        with:
-          config: cliff.toml
-          args: --tag ${{ github.event.release.tag_name }} --latest --strip header
-        # The action exposes the rendered notes; wire them to the release body
-        # and commit CHANGELOG.md back to main at first real release.
