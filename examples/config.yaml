@@ -1,0 +1,37 @@
+# Example: a 3-persona "dev squad" sharing one Hermes brain.
+#
+# Merge the `discord_personas` platform block into ~/.hermes/config.yaml, put the
+# bot tokens in ~/.hermes/.env (referenced by `token_env`), and enable the plugin:
+#
+#   plugins:
+#     enabled:
+#       - discord-personas
+#
+# Then: hermes gateway restart
+
+gateway:
+  platforms:
+    discord_personas:
+      enabled: true
+      extra:
+        brain: main            # the single shared-brain agent/profile every persona routes to
+        ignore_self: true      # never react to messages our own personas posted (loop guard)
+        default_persona: alex  # used for cron/proactive sends; defaults to the first persona
+        personas:
+          - id: alex
+            token_env: DISCORD_TOKEN_ALEX
+            display_name: Alex
+            # application_id: "111111111111111111"   # optional
+          - id: sam
+            token_env: DISCORD_TOKEN_SAM
+            display_name: Sam
+          - id: max
+            token_env: DISCORD_TOKEN_MAX
+            display_name: Max
+
+# ~/.hermes/.env (DO NOT COMMIT):
+#   DISCORD_TOKEN_ALEX=...
+#   DISCORD_TOKEN_SAM=...
+#   DISCORD_TOKEN_MAX=...
+#   DISCORD_PERSONAS_ALLOWED_USERS=284102345871466496
+#   DISCORD_PERSONAS_HOME_CHANNEL=123456789012345678

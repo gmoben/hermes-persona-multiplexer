@@ -1,0 +1,124 @@
+"""Tests for the Hermes-independent routing core.
+
+Fixtures use a generic demo squad (alex/sam/max) — this is a standalone,
+project-agnostic plugin, so no downstream project's persona names appear here.
+"""
+
+import pytest
+
+from discord_personas import routing as r
+
+
+def _cfg(**over):
+    base = {
+        "brain": "main",
+        "personas": [
+            {"id": "alex", "token_env": "TOK_ALEX", "display_name": "Alex"},
+            {"id": "sam", "token_env": "TOK_SAM"},
+        ],
+    }
+    base.update(over)
+    return r.parse_config(base)
+
+
+def test_parse_config_happy_path():
+    cfg = _cfg()
+    assert cfg.brain == "main"
+    assert cfg.ids == ("alex", "sam")
+    assert cfg.default_persona == "alex"  # defaults to first
+    assert cfg.persona("alex").label == "Alex"
+    assert cfg.persona("sam").label == "sam"  # falls back to id
+    assert cfg.ignore_self is True
+
+
+def test_parse_config_explicit_default_persona():
+    cfg = _cfg(default_persona="sam")
+    assert cfg.default_persona == "sam"
+
+
+@pytest.mark.parametrize(
+    "raw, msg",
+    [
+        ({"personas": []}, "non-empty"),
+        ({"personas": [{"token_env": "X"}]}, "missing `id`"),
+        ({"personas": [{"id": "a"}]}, "missing `token_env`"),
+        (
+            {"personas": [{"id": "a", "token_env": "X"}, {"id": "a", "token_env": "Y"}]},
+            "duplicate persona id",
+        ),
+        (
+            {"personas": [{"id": "a", "token_env": "X"}, {"id": "b", "token_env": "X"}]},
+            "duplicate token_env",
+        ),
+        (
+            {"personas": [{"id": "a", "token_env": "X"}], "default_persona": "nope"},
+            "not a configured persona",
+        ),
+    ],
+)
+def test_parse_config_errors(raw, msg):
+    with pytest.raises(r.ConfigError) as exc:
+        r.parse_config(raw)
+    assert msg in str(exc.value)
+
+
+def test_is_self_authored():
+    assert r.is_self_authored("42", ["1", "42"]) is True
+    assert r.is_self_authored("99", ["1", "42"]) is False
+    assert r.is_self_authored(None, ["1"]) is False
+    # type coercion
+    assert r.is_self_authored(42, [42]) is True
+
+
+def test_decide_inbound_processes_known_persona():
+    cfg = _cfg()
+    d = r.decide_inbound(recipient_persona="alex", author_account_id="user1",
+                         own_account_ids={"botAlex", "botSam"}, config=cfg)
+    assert d.process is True
+    assert d.persona == "alex"
+    assert d.reason == "ok"
+
+
+def test_decide_inbound_skips_own_account():
+    cfg = _cfg()
+    d = r.decide_inbound(recipient_persona="alex", author_account_id="botSam",
+                         own_account_ids={"botAlex", "botSam"}, config=cfg)
+    assert d.process is False
+    assert d.reason == "own-account"
+
+
+def test_decide_inbound_unknown_persona():
+    cfg = _cfg()
+    d = r.decide_inbound(recipient_persona="ghost", author_account_id="user1",
+                         own_account_ids=set(), config=cfg)
+    assert d.process is False
+    assert d.reason.startswith("unknown-persona")
+
+
+def test_decide_inbound_ignore_self_disabled():
+    cfg = _cfg(ignore_self=False)
+    d = r.decide_inbound(recipient_persona="alex", author_account_id="botAlex",
+                         own_account_ids={"botAlex"}, config=cfg)
+    assert d.process is True
+
+
+def test_resolve_outbound_persona_priority():
+    cfg = _cfg()
+    # explicit wins
+    assert r.resolve_outbound_persona(explicit="sam", inbound="alex", config=cfg) == "sam"
+    # inbound next
+    assert r.resolve_outbound_persona(explicit=None, inbound="alex", config=cfg) == "alex"
+    # default last
+    assert r.resolve_outbound_persona(explicit=None, inbound=None, config=cfg) == "alex"
+    # inbound unknown -> default
+    assert r.resolve_outbound_persona(explicit=None, inbound="ghost", config=cfg) == "alex"
+
+
+def test_resolve_outbound_persona_unknown_explicit_raises():
+    cfg = _cfg()
+    with pytest.raises(KeyError):
+        r.resolve_outbound_persona(explicit="ghost", inbound=None, config=cfg)
+
+
+def test_persona_metadata():
+    assert r.persona_metadata("alex") == {"persona": "alex"}

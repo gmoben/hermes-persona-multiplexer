@@ -1,0 +1,38 @@
+[project]
+name = "hermes-persona-multiplexer"
+version = "0.1.0"
+description = "One Hermes brain, many Discord faces — a multi-account Discord platform plugin for Hermes Agent."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "gmoben", email = "ben@warr.io" }]
+requires-python = ">=3.11"
+keywords = ["hermes-agent", "discord", "ai-agent", "plugin", "multi-agent", "persona"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Communications :: Chat",
+]
+
+# Runtime dependencies (discord.py, Hermes Agent) are provided by the Hermes host
+# environment; they are intentionally not hard-pinned here so the core remains
+# installable/testable standalone.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.urls]
+Homepage = "https://github.com/gmoben/hermes-persona-multiplexer"
+Issues = "https://github.com/gmoben/hermes-persona-multiplexer/issues"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
