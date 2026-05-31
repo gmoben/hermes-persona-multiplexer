@@ -40,6 +40,8 @@ def _make_adapter(monkeypatch, own=()):  # bypass BasePlatformAdapter.__init__
     ad = a.DiscordPersonasAdapter.__new__(a.DiscordPersonasAdapter)
     ad.mux = _cfg()
     ad._own_account_ids = set(own)
+    ad._account_to_persona = {}
+    ad._home_channel_id = None
     ad.handled = []
     ad.build_source = lambda **kw: kw  # SessionSource stand-in: the kwargs dict
     async def _handle(event):
@@ -122,3 +124,46 @@ def test_on_inbound_unknown_persona_is_dropped(monkeypatch):
 def test_decode_roundtrip(enc, persona, raw):
     assert a.encode_chat_id(persona, raw) == enc
     assert a.decode_chat_id(enc) == (persona, raw)
+
+
+# ── shared-channel intake ──────────────────────────────────────────────────
+def test_on_inbound_channel_orchestrator_intakes(monkeypatch):
+    ad = _make_adapter(monkeypatch)
+    ad._home_channel_id = "777"
+    asyncio.run(
+        ad._on_inbound(
+            recipient_persona="alex",  # default => orchestrator
+            author_account_id="u1", raw_chat_id="777", text="a photo",
+            message_id="1", chat_type="group", chat_name="general", user_name="u",
+        )
+    )
+    assert len(ad.handled) == 1
+    ev = ad.handled[0]
+    # shared-channel prompt instructs the routing tag and namespaces to the orchestrator
+    assert "[persona:" in ev.channel_prompt
+    assert ev.source["chat_id"] == "p!alex!777"
+
+
+def test_on_inbound_channel_non_orchestrator_dropped(monkeypatch):
+    ad = _make_adapter(monkeypatch)
+    ad._home_channel_id = "777"
+    asyncio.run(
+        ad._on_inbound(
+            recipient_persona="sam",  # not the orchestrator -> dedup drop
+            author_account_id="u1", raw_chat_id="777", text="hi",
+            message_id="1", chat_type="group", chat_name="general", user_name="u",
+        )
+    )
+    assert ad.handled == []
+
+
+def test_on_inbound_channel_outside_home_dropped(monkeypatch):
+    ad = _make_adapter(monkeypatch)
+    ad._home_channel_id = "777"
+    asyncio.run(
+        ad._on_inbound(
+            recipient_persona="alex", author_account_id="u1", raw_chat_id="999",
+            text="hi", message_id="1", chat_type="group", chat_name="other", user_name="u",
+        )
+    )
+    assert ad.handled == []

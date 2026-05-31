@@ -17,6 +17,9 @@ gateway:
         brain: main            # the single shared-brain agent/profile every persona routes to
         ignore_self: true      # never react to messages our own personas posted (loop guard)
         default_persona: alex  # used for cron/proactive sends; defaults to the first persona
+        orchestrator: alex     # intakes shared-channel messages, then the brain replies as
+                               #   the right persona via a `[persona:<id>]` tag; defaults to
+                               #   default_persona
         personas:
           - id: alex
             token_env: DISCORD_TOKEN_ALEX
@@ -29,9 +32,14 @@ gateway:
             token_env: DISCORD_TOKEN_MAX
             display_name: Max
 
+# DMs to any bot are answered by that persona. In a shared channel, invite all the
+# bots and set DISCORD_PERSONAS_HOME_CHANNEL to its id: the orchestrator intakes each
+# message once, the brain decides who answers, and that persona's bot delivers the
+# reply. Without a home channel set, the bots only respond to DMs.
+#
 # ~/.hermes/.env (DO NOT COMMIT):
 #   DISCORD_TOKEN_ALEX=...
 #   DISCORD_TOKEN_SAM=...
 #   DISCORD_TOKEN_MAX=...
 #   DISCORD_PERSONAS_ALLOWED_USERS=284102345871466496
-#   DISCORD_PERSONAS_HOME_CHANNEL=123456789012345678
+#   DISCORD_PERSONAS_HOME_CHANNEL=123456789012345678   # shared channel (omit for DM-only)

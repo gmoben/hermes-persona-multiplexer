@@ -8,11 +8,17 @@ network access. All Hermes/discord wiring lives in :mod:`adapter`.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
 #: Platform name registered with the Hermes gateway.
 PLATFORM_NAME = "discord_personas"
+
+#: Reply-routing tag the brain emits at the very start of a shared-channel reply
+#: to choose which persona's bot account delivers it, e.g. ``[persona:<id>] ...``.
+#: Parsed + stripped by the adapter's send path (see :func:`extract_reply_persona`).
+_REPLY_TAG_RE = re.compile(r"^\s*\[persona:\s*([A-Za-z0-9_-]+)\s*\]\s*")
 
 
 class ConfigError(ValueError):
@@ -40,12 +46,16 @@ class MultiplexerConfig:
     ``brain`` is the Hermes agent/profile every persona routes to — this is the
     single shared brain. ``default_persona`` is used for proactive/cron sends
     that don't originate from an inbound message; it falls back to the first
-    configured persona.
+    configured persona. ``orchestrator`` is the persona that intakes shared
+    home-channel messages (so a channel message reaches the brain once, not once
+    per persona); the brain then replies as the right specialist. It defaults to
+    ``default_persona``.
     """
 
     brain: str
     personas: tuple[PersonaConfig, ...]
     default_persona: str
+    orchestrator: str
     ignore_self: bool = True
 
     def has(self, persona_id: str) -> bool:
@@ -80,6 +90,8 @@ def parse_config(raw: dict | None) -> MultiplexerConfig:
           brain: main
           ignore_self: true            # optional, default true
           default_persona: alex        # optional, defaults to first persona
+          orchestrator: alex           # optional, intakes shared-channel msgs;
+                                       #   defaults to default_persona
           personas:
             - id: alex
               token_env: DISCORD_TOKEN_ALEX
@@ -131,10 +143,19 @@ def parse_config(raw: dict | None) -> MultiplexerConfig:
     else:
         default_persona = personas[0].id
 
+    orchestrator = raw.get("orchestrator")
+    if orchestrator is not None:
+        orchestrator = str(orchestrator).strip()
+        if orchestrator not in ids:
+            raise ConfigError(f"orchestrator '{orchestrator}' is not a configured persona")
+    else:
+        orchestrator = default_persona
+
     return MultiplexerConfig(
         brain=brain,
         personas=tuple(personas),
         default_persona=default_persona,
+        orchestrator=orchestrator,
         ignore_self=bool(raw.get("ignore_self", True)),
     )
 
@@ -156,17 +177,56 @@ def decide_inbound(
     author_account_id: str | None,
     own_account_ids: Iterable[str],
     config: MultiplexerConfig,
+    is_dm: bool = True,
+    channel_id: str | None = None,
+    home_channel_id: str | None = None,
 ) -> ProcessDecision:
     """Decide whether to process an inbound message and which persona owns it.
 
     ``recipient_persona`` is the persona whose bot account received the message
     (each Discord client is labeled with its persona at construction time).
+
+    DMs are handled by the addressed persona (one bot = one persona). A **shared
+    channel** message is seen by every persona's client, so to reach the brain
+    exactly once it is only intaken by the ``orchestrator`` persona, and only in
+    the configured ``home_channel_id`` (channels are ignored entirely when no home
+    channel is configured). The brain then classifies the content and replies as
+    the right specialist via a reply-routing tag (see :func:`extract_reply_persona`).
     """
     if not config.has(recipient_persona):
         return ProcessDecision(False, f"unknown-persona:{recipient_persona}", None)
     if config.ignore_self and is_self_authored(author_account_id, own_account_ids):
         return ProcessDecision(False, "own-account", recipient_persona)
-    return ProcessDecision(True, "ok", recipient_persona)
+    if is_dm:
+        return ProcessDecision(True, "ok", recipient_persona)
+    # Shared-channel message.
+    if home_channel_id is None or str(channel_id) != str(home_channel_id):
+        return ProcessDecision(False, "outside-home-channel", None)
+    if recipient_persona != config.orchestrator:
+        return ProcessDecision(False, "not-orchestrator", None)
+    return ProcessDecision(True, "ok-channel", recipient_persona)
+
+
+def extract_reply_persona(
+    content: str, valid_ids: Iterable[str]
+) -> tuple[str | None, str]:
+    """Pull a leading ``[persona:<id>]`` routing tag off an outbound reply.
+
+    Returns ``(persona_id, content_without_tag)`` when the reply starts with a
+    tag naming a known persona; otherwise ``(None, content)`` unchanged. Lets the
+    shared-brain choose which persona's bot delivers a shared-channel reply.
+    """
+    if not content:
+        return None, content
+    m = _REPLY_TAG_RE.match(content)
+    if not m:
+        return None, content
+    tag = m.group(1).strip()
+    canonical = {str(v).lower(): str(v) for v in valid_ids}
+    resolved = canonical.get(tag.lower())
+    if resolved is None:
+        return None, content  # unknown persona — leave the text untouched
+    return resolved, content[m.end():]
 
 
 def resolve_outbound_persona(

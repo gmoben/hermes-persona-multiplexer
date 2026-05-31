@@ -38,18 +38,28 @@ brain** — the capability people keep asking for after migrating from OpenClaw.
                 └── outbound replies routed back through the SAME persona's client
 ```
 
-- **Inbound:** each client is labeled with its persona; messages are stamped with
-  `persona=<id>` and forwarded to the single agent (shared `HERMES_HOME` ⇒ shared
-  memory). DM @Alex → the brain answers as Alex; DM @Sam → as Sam.
-- **Outbound:** replies route back through the originating persona's client, so
-  the right avatar speaks — in DMs *and* shared channels.
+- **DMs:** each client is labeled with its persona; a DM is forwarded to the single
+  agent (shared `HERMES_HOME` ⇒ shared memory) and answered by that persona. DM
+  @Alex → the brain answers as Alex; DM @Sam → as Sam.
+- **Shared channel:** invite all the bots and set `DISCORD_PERSONAS_HOME_CHANNEL`.
+  Every client sees each message, so to reach the brain *once* only the
+  `orchestrator` persona intakes it; the brain then decides who should answer and
+  starts its reply with a `[persona:<id>]` tag, which the send path strips and uses
+  to deliver through that persona's bot. No home channel set ⇒ DM-only.
+- **Outbound:** replies route back through the chosen persona's client, so the right
+  avatar speaks — in DMs *and* the shared channel.
 - **No loops:** messages authored by any of our own persona accounts are ignored
   (the one brain decides who speaks). Pair with `DISCORD_ALLOW_BOTS=none`.
 
 ## Install
 
+`hermes plugins install` clones the default branch (no git-ref pinning), so to pin
+a release, tag-clone + install from the local path:
+
 ```bash
-hermes plugins install https://github.com/gmoben/hermes-persona-multiplexer@v0.1.0
+git clone --branch v0.3.0 https://github.com/gmoben/hermes-persona-multiplexer.git /tmp/hpm
+hermes plugins install file:///tmp/hpm && rm -rf /tmp/hpm
+# or unpinned (tracks main): hermes plugins install gmoben/hermes-persona-multiplexer
 ```
 
 Enable it and configure personas in `~/.hermes/config.yaml` (see
@@ -66,6 +76,7 @@ gateway:
       extra:
         brain: main
         default_persona: alex
+        orchestrator: alex   # intakes shared-channel messages (defaults to default_persona)
         personas:
           - { id: alex, token_env: DISCORD_TOKEN_ALEX }
           - { id: sam,  token_env: DISCORD_TOKEN_SAM }

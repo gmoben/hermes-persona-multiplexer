@@ -122,3 +122,79 @@ def test_resolve_outbound_persona_unknown_explicit_raises():
 
 def test_persona_metadata():
     assert r.persona_metadata("alex") == {"persona": "alex"}
+
+
+# ── orchestrator + shared-channel routing ──────────────────────────────────
+def test_orchestrator_defaults_to_default_persona():
+    assert _cfg().orchestrator == "alex"
+    assert _cfg(default_persona="sam").orchestrator == "sam"
+
+
+def test_orchestrator_explicit_overrides_default():
+    cfg = _cfg(default_persona="alex", orchestrator="sam")
+    assert cfg.orchestrator == "sam"
+    assert cfg.default_persona == "alex"
+
+
+def test_orchestrator_must_be_a_configured_persona():
+    with pytest.raises(r.ConfigError) as exc:
+        _cfg(orchestrator="ghost")
+    assert "orchestrator" in str(exc.value)
+
+
+def test_decide_inbound_dm_unchanged():
+    cfg = _cfg()
+    d = r.decide_inbound(recipient_persona="sam", author_account_id="u1",
+                         own_account_ids=set(), config=cfg, is_dm=True)
+    assert d.process is True and d.persona == "sam"
+
+
+def test_decide_inbound_channel_only_orchestrator_intakes():
+    cfg = _cfg()  # orchestrator defaults to alex
+    intake = r.decide_inbound(recipient_persona="alex", author_account_id="u1",
+                              own_account_ids=set(), config=cfg,
+                              is_dm=False, channel_id="C1", home_channel_id="C1")
+    assert intake.process is True and intake.reason == "ok-channel"
+    other = r.decide_inbound(recipient_persona="sam", author_account_id="u1",
+                             own_account_ids=set(), config=cfg,
+                             is_dm=False, channel_id="C1", home_channel_id="C1")
+    assert other.process is False and other.reason == "not-orchestrator"
+
+
+def test_decide_inbound_channel_confined_to_home():
+    cfg = _cfg()
+    outside = r.decide_inbound(recipient_persona="alex", author_account_id="u1",
+                               own_account_ids=set(), config=cfg,
+                               is_dm=False, channel_id="C2", home_channel_id="C1")
+    assert outside.process is False and outside.reason == "outside-home-channel"
+    # no home channel configured -> channels are ignored entirely
+    none_cfg = r.decide_inbound(recipient_persona="alex", author_account_id="u1",
+                                own_account_ids=set(), config=cfg,
+                                is_dm=False, channel_id="C1", home_channel_id=None)
+    assert none_cfg.process is False and none_cfg.reason == "outside-home-channel"
+
+
+def test_decide_inbound_channel_still_skips_own_accounts():
+    cfg = _cfg()
+    d = r.decide_inbound(recipient_persona="alex", author_account_id="botSam",
+                         own_account_ids={"botSam"}, config=cfg,
+                         is_dm=False, channel_id="C1", home_channel_id="C1")
+    assert d.process is False and d.reason == "own-account"
+
+
+@pytest.mark.parametrize(
+    "content, expected_persona, expected_text",
+    [
+        ("[persona:sam] hello", "sam", "hello"),
+        ("[persona:Alex]\nhey there", "alex", "hey there"),
+        ("  [persona: sam ]  hi", "sam", "hi"),
+        ("just a normal reply", None, "just a normal reply"),
+        ("[persona:ghost] unknown stays put", None, "[persona:ghost] unknown stays put"),
+        ("text then [persona:sam]", None, "text then [persona:sam]"),
+        ("", None, ""),
+    ],
+)
+def test_extract_reply_persona(content, expected_persona, expected_text):
+    persona, text = r.extract_reply_persona(content, ("alex", "sam"))
+    assert persona == expected_persona
+    assert text == expected_text

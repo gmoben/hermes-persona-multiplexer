@@ -25,6 +25,7 @@ from .routing import (
     PLATFORM_NAME,
     MultiplexerConfig,
     decide_inbound,
+    extract_reply_persona,
     parse_config,
     resolve_outbound_persona,
 )
@@ -90,12 +91,34 @@ def decode_chat_id(chat_id: str) -> tuple[str | None, str]:
 
 
 def persona_channel_prompt(label: str, persona_id: str) -> str:
-    """Per-message system prompt telling the brain which face it wears now."""
+    """Per-message system prompt telling the brain which face it wears now (DMs)."""
     return (
-        f"You are replying as the **{label}** persona (id `{persona_id}`) of the "
-        f"Mushroom Kingdom health crew — one shared brain, many Discord faces. "
-        f"Speak only in {label}'s voice and stay in their lane. Never @-mention or "
-        f"impersonate the other personas (it causes loops)."
+        f"You are replying as the **{label}** persona (id `{persona_id}`) — one of "
+        f"several Discord faces sharing this single brain and memory. Speak only in "
+        f"{label}'s voice and stay in their lane. Never @-mention or impersonate the "
+        f"other personas (it causes loops)."
+    )
+
+
+def shared_channel_prompt(personas, orchestrator_id: str) -> str:
+    """Per-message system prompt for the shared channel — choose + route the reply.
+
+    All personas live in the shared channel but the message reaches the brain once
+    (via the orchestrator). The brain decides which single persona should answer
+    and starts its reply with a ``[persona:<id>]`` tag, which the send path consumes
+    to deliver through that persona's bot account.
+    """
+    roster = ", ".join(
+        f"`{p.id}`" + (f" ({p.display_name})" if p.display_name else "") for p in personas
+    )
+    return (
+        "This is the shared channel where all your personas live — one brain, many "
+        "Discord faces. Read the message (text and any image), decide which single "
+        "persona should answer, and start your reply with a routing tag on its own "
+        "line naming that persona, e.g. `[persona:<id>]`. Personas: " + roster + ". "
+        f"Use the orchestrator `{orchestrator_id}` for general, multi-topic, or "
+        "coordination messages. Emit exactly one tag at the very start, then speak "
+        "only in that persona's voice. Never @-mention the other bots (it loops)."
     )
 
 
@@ -115,8 +138,13 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         self._tasks: dict[str, asyncio.Task] = {}          # persona_id -> client.start() task
         self._ready: dict[str, asyncio.Event] = {}         # persona_id -> READY event
         self._own_account_ids: set[str] = set()            # bot user ids of all personas
+        self._account_to_persona: dict[str, str] = {}      # bot user id -> persona id
         self._tokens: dict[str, str] = {}                  # persona_id -> token value
         self._typing_tasks: dict[str, asyncio.Task] = {}   # chat_id -> typing-loop task
+        # Shared home channel (cron + content-led inbound); None disables channel intake.
+        self._home_channel_id: str | None = (
+            os.getenv("DISCORD_PERSONAS_HOME_CHANNEL", "").strip() or None
+        )
 
     # -- lifecycle ---------------------------------------------------------
     def _build_client(self, persona) -> discord.Client:
@@ -141,6 +169,7 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         async def on_ready():  # noqa: ANN202 - discord callback
             if client.user is not None:
                 adapter._own_account_ids.add(str(client.user.id))
+                adapter._account_to_persona[str(client.user.id)] = pid
             logger.info("[%s] persona '%s' ready as %s", PLATFORM_NAME, pid, client.user)
             ready.set()
 
@@ -160,11 +189,23 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
                 return
             is_dm = isinstance(message.channel, discord.DMChannel)
             guild = getattr(message, "guild", None)
+            # Make mentions of our own personas readable to the brain
+            # (`<@123>` -> `@Label`) so it can honor explicit address in-channel.
+            text = message.content or ""
+            for um in getattr(message, "mentions", None) or []:
+                mapped = adapter._account_to_persona.get(str(getattr(um, "id", "")))
+                if mapped:
+                    label = (
+                        adapter.mux.persona(mapped).label if adapter.mux.has(mapped) else mapped
+                    )
+                    text = text.replace(f"<@{um.id}>", f"@{label}").replace(
+                        f"<@!{um.id}>", f"@{label}"
+                    )
             await adapter._on_inbound(
                 recipient_persona=pid,
                 author_account_id=str(message.author.id),
                 raw_chat_id=str(message.channel.id),
-                text=message.content or "",
+                text=text,
                 message_id=str(message.id),
                 chat_type="dm" if is_dm else "group",
                 chat_name=(
@@ -275,17 +316,28 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         Loop prevention + persona resolution live in the pure core
         (``tests/test_routing.py``); this just wires Discord -> Hermes.
         """
+        is_dm = chat_type == "dm"
         decision = decide_inbound(
             recipient_persona=recipient_persona,
             author_account_id=author_account_id,
             own_account_ids=self._own_account_ids,
             config=self.mux,
+            is_dm=is_dm,
+            channel_id=raw_chat_id,
+            home_channel_id=self._home_channel_id,
         )
         if not decision.process:
             logger.debug("[%s] dropping message (%s)", PLATFORM_NAME, decision.reason)
             return None
 
         persona = self.mux.persona(recipient_persona)
+        # DMs are owned by the addressed persona; shared-channel messages are
+        # intaken by the orchestrator, which classifies + routes the reply.
+        channel_prompt = (
+            persona_channel_prompt(persona.label, recipient_persona)
+            if is_dm
+            else shared_channel_prompt(self.mux.personas, self.mux.orchestrator)
+        )
         source = self.build_source(  # type: ignore[attr-defined]
             chat_id=encode_chat_id(recipient_persona, raw_chat_id),
             chat_name=chat_name,
@@ -301,7 +353,7 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
             message_type=MessageType.TEXT,
             source=source,
             message_id=message_id,
-            channel_prompt=persona_channel_prompt(persona.label, recipient_persona),
+            channel_prompt=channel_prompt,
         )
         return await self.handle_message(event)  # type: ignore[attr-defined]
 
@@ -310,9 +362,12 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         """Route an outbound message through the correct persona's client."""
         metadata = metadata or {}
         inbound_persona, raw_chat_id = decode_chat_id(str(chat_id))
+        # A shared-channel reply may begin with a `[persona:<id>]` routing tag the
+        # brain chose; it wins over the inbound persona and is stripped from the text.
+        tag_persona, content = extract_reply_persona(str(content), self.mux.ids)
         try:
             persona_id = resolve_outbound_persona(
-                explicit=metadata.get("persona"),
+                explicit=tag_persona or metadata.get("persona"),
                 inbound=inbound_persona,
                 config=self.mux,
             )
@@ -424,7 +479,10 @@ async def standalone_send(pconfig, chat_id, message, *, thread_id=None,
     extra = getattr(pconfig, "extra", None) or {}
     mux = parse_config(extra.get(PLATFORM_NAME, extra))
     inbound_persona, raw_chat_id = decode_chat_id(str(chat_id))
-    persona_id = resolve_outbound_persona(explicit=None, inbound=inbound_persona, config=mux)
+    # Let a cron job pick its persona with a leading `[persona:<id>]` tag (e.g. a
+    # scheduled report delivers as a specific persona); else fall back to the chat's persona.
+    tag_persona, message = extract_reply_persona(str(message), mux.ids)
+    persona_id = resolve_outbound_persona(explicit=tag_persona, inbound=inbound_persona, config=mux)
     persona = mux.persona(persona_id)
     token = os.getenv(persona.token_env, "").strip()
     if not token:
