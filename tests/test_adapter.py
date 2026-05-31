@@ -139,8 +139,10 @@ def test_on_inbound_channel_orchestrator_intakes(monkeypatch):
     )
     assert len(ad.handled) == 1
     ev = ad.handled[0]
-    # shared-channel prompt instructs the routing tag and namespaces to the orchestrator
+    # shared-channel prompt instructs a quick (untagged) ack, then the routing tag,
+    # and namespaces the session to the orchestrator
     assert "[persona:" in ev.channel_prompt
+    assert "no persona tag" in ev.channel_prompt.lower()
     assert ev.source["chat_id"] == "p!alex!777"
 
 

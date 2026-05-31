@@ -101,24 +101,29 @@ def persona_channel_prompt(label: str, persona_id: str) -> str:
 
 
 def shared_channel_prompt(personas, orchestrator_id: str) -> str:
-    """Per-message system prompt for the shared channel — choose + route the reply.
+    """Per-message system prompt for the shared channel — fast ack, then route the reply.
 
     All personas live in the shared channel but the message reaches the brain once
-    (via the orchestrator). The brain decides which single persona should answer
-    and starts its reply with a ``[persona:<id>]`` tag, which the send path consumes
-    to deliver through that persona's bot account.
+    (via the orchestrator). For snappy UX the brain first sends a one-line
+    acknowledgment as the orchestrator (an untagged interim message), then does the
+    work and sends its full answer starting with a ``[persona:<id>]`` tag, which the
+    send path consumes to deliver through the chosen persona's bot account.
     """
     roster = ", ".join(
         f"`{p.id}`" + (f" ({p.display_name})" if p.display_name else "") for p in personas
     )
     return (
         "This is the shared channel where all your personas live — one brain, many "
-        "Discord faces. Read the message (text and any image), decide which single "
-        "persona should answer, and start your reply with a routing tag on its own "
-        "line naming that persona, e.g. `[persona:<id>]`. Personas: " + roster + ". "
-        f"Use the orchestrator `{orchestrator_id}` for general, multi-topic, or "
-        "coordination messages. Emit exactly one tag at the very start, then speak "
-        "only in that persona's voice. Never @-mention the other bots (it loops)."
+        "Discord faces. Respond in two steps:\n"
+        "1. Right away, send ONE short line as the orchestrator (no persona tag) saying "
+        'what you are about to do, so the user is not left waiting (e.g. "On it — '
+        'looking into that now…").\n'
+        "2. Then do the work and send your full answer, starting it with a `[persona:<id>]` "
+        "tag naming the single persona who should respond.\n"
+        "Personas: " + roster + f". Use the orchestrator `{orchestrator_id}` for general, "
+        "multi-topic, or coordination messages. Put exactly one tag at the very start of "
+        "the final answer, speak only in that persona's voice, and never @-mention the "
+        "other bots (it loops)."
     )
 
 
