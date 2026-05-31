@@ -10,8 +10,8 @@ import asyncio
 
 import pytest
 
-from discord_personas import adapter as a
-from discord_personas.routing import parse_config
+from hermes_persona_multiplexer import adapter as a
+from hermes_persona_multiplexer.routing import parse_config
 
 
 def _cfg():

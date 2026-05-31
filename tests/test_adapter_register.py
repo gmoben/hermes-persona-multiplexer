@@ -1,11 +1,11 @@
 """Tests for the plugin registration entry point and chat-id codec.
 
-These import ``discord_personas.adapter`` directly — safe even without Hermes,
-because the Hermes/discord imports in that module are guarded.
+These import ``hermes_persona_multiplexer.adapter`` directly — safe even without
+Hermes, because the Hermes/discord imports in that module are guarded.
 """
 
-from discord_personas import adapter as a
-from discord_personas.routing import PLATFORM_NAME
+from hermes_persona_multiplexer import adapter as a
+from hermes_persona_multiplexer.routing import PLATFORM_NAME
 
 
 class FakeCtx:
@@ -33,8 +33,8 @@ def test_register_registers_platform():
 
 
 def test_top_level_register_delegates():
-    # discord_personas.register() should forward to adapter.register()
-    from discord_personas import register as pkg_register
+    # hermes_persona_multiplexer.register() should forward to adapter.register()
+    from hermes_persona_multiplexer import register as pkg_register
 
     ctx = FakeCtx()
     assert pkg_register(ctx) == PLATFORM_NAME

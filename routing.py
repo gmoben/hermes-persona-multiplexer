@@ -3,7 +3,7 @@
 This module is intentionally free of any Hermes or ``discord.py`` imports so the
 decision logic — config parsing, persona resolution, loop prevention, and
 outbound send routing — can be unit-tested without a running gateway or any
-network access. All Hermes/discord wiring lives in :mod:`discord_personas.adapter`.
+network access. All Hermes/discord wiring lives in :mod:`adapter`.
 """
 
 from __future__ import annotations

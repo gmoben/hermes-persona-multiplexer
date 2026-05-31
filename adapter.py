@@ -1,7 +1,7 @@
 """Hermes gateway wiring for the persona multiplexer.
 
-Connects the pure decision logic in :mod:`discord_personas.routing` and
-:mod:`discord_personas.locks` to the Hermes gateway and ``discord.py``.
+Connects the pure decision logic in :mod:`routing` and :mod:`locks` to the
+Hermes gateway and ``discord.py``.
 
 It runs **N Discord clients in one process** (one per persona/bot token), tags
 every inbound event with the persona whose account received it, and forwards all
@@ -57,7 +57,7 @@ except Exception:  # noqa: BLE001
 
         def __init__(self, *args, **kwargs):
             raise RuntimeError(
-                "discord_personas adapter requires Hermes Agent at runtime "
+                "persona-multiplexer adapter requires Hermes Agent at runtime "
                 "(gateway.platforms.base could not be imported)."
             )
 

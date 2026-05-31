@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "hermes-persona-multiplexer"
 version = "0.1.0"
@@ -25,6 +29,14 @@ dev = ["pytest>=8", "ruff>=0.6"]
 Homepage = "https://github.com/gmoben/hermes-persona-multiplexer"
 Issues = "https://github.com/gmoben/hermes-persona-multiplexer/issues"
 
+[tool.setuptools]
+# Canonical Hermes flat plugin layout: Hermes loads the plugin *directory* as a
+# package, so the importable code lives in top-level modules at the repo root
+# (alongside a register() shim in __init__.py that only Hermes's dir-loader uses).
+# Declare the modules explicitly so an editable install doesn't trip setuptools'
+# flat-layout auto-discovery — which would otherwise also vacuum up conftest.py.
+py-modules = ["routing", "locks", "adapter"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
@@ -38,3 +50,8 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+# The plugin loads as a package (hermes_persona_multiplexer) and its modules are
+# also importable top-level; treat both as first-party so test import blocks sort.
+known-first-party = ["hermes_persona_multiplexer", "routing", "locks", "adapter"]

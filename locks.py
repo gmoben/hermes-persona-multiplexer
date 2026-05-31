@@ -8,7 +8,7 @@ a single token is already in use or invalid. It degrades: the conflicting
 persona is disabled, the rest stay online.
 
 The acquire/release primitives are injected so this module is testable without
-Hermes; :mod:`discord_personas.adapter` wires in the real ones.
+Hermes; :mod:`adapter` wires in the real ones.
 """
 
 from __future__ import annotations

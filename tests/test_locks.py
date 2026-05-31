@@ -3,7 +3,7 @@
 Generic demo squad (alex/sam/max) only — no downstream project names.
 """
 
-from discord_personas.locks import ScopedLockManager
+from hermes_persona_multiplexer.locks import ScopedLockManager
 
 
 def test_inproc_acquire_and_conflict():

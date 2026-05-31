@@ -6,7 +6,7 @@ project-agnostic plugin, so no downstream project's persona names appear here.
 
 import pytest
 
-from discord_personas import routing as r
+from hermes_persona_multiplexer import routing as r
 
 
 def _cfg(**over):
