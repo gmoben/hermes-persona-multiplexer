@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.3](https://github.com/gmoben/hermes-persona-multiplexer/compare/v0.4.2...v0.4.3) (2026-05-31)
+
+
+### Bug Fixes
+
+* deliver LLM file attachments natively instead of as a dead path ([6fe652d](https://github.com/gmoben/hermes-persona-multiplexer/commit/6fe652d6e6c7ecabcae18c3fa506be9bacfb333f))
+
 ## [0.4.2](https://github.com/gmoben/hermes-persona-multiplexer/compare/v0.4.1...v0.4.2) (2026-05-31)
 
 
