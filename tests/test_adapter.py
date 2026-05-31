@@ -150,6 +150,31 @@ def test_on_inbound_text_only_has_empty_media(monkeypatch):
     assert ev.message_type == "text"
 
 
+# ── outbound attachment persona routing ────────────────────────────────────
+def test_persona_for_outbound_dm_uses_decoded_persona(monkeypatch):
+    ad = _make_adapter(monkeypatch)
+    assert ad._persona_for_outbound("p!sam!42") == ("sam", "42")
+
+
+def test_persona_for_outbound_channel_prefers_answering_persona(monkeypatch):
+    ad = _make_adapter(monkeypatch)
+    ad._home_channel_id = "777"
+    ad._reply_persona = {"777": "sam"}  # the turn's [persona:] tag chose sam
+    # decoded id is the orchestrator (alex), but the reply — and its attachment — is sam's
+    assert ad._persona_for_outbound("p!alex!777") == ("sam", "777")
+
+
+def test_persona_for_outbound_channel_without_reply_uses_decoded(monkeypatch):
+    ad = _make_adapter(monkeypatch)
+    ad._home_channel_id = "777"
+    assert ad._persona_for_outbound("p!alex!777") == ("alex", "777")
+
+
+def test_persona_for_outbound_unknown_persona_uses_default(monkeypatch):
+    ad = _make_adapter(monkeypatch)
+    assert ad._persona_for_outbound("p!ghost!42") == ("alex", "42")  # default_persona
+
+
 @pytest.mark.parametrize(
     "enc,persona,raw",
     [

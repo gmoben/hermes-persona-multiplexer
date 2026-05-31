@@ -486,6 +486,77 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
                           message_id=message_ids[0] if message_ids else None,
                           raw_response={"message_ids": message_ids, "persona": persona_id})
 
+    # -- outbound attachments ----------------------------------------------
+    def _persona_for_outbound(self, chat_id):
+        """Resolve ``(persona_id, raw_chat_id)`` for an outbound action on a chat.
+
+        In the shared home channel the *answering* persona owns the reply and any
+        attachments that trail it (tracked in ``_reply_persona`` from the turn's
+        ``[next:]``/``[persona:]`` tag); a DM is owned by its addressed persona.
+        Falls back to the default persona when the resolved id isn't configured.
+        """
+        persona_id, raw_chat_id = decode_chat_id(str(chat_id))
+        if self._home_channel_id and raw_chat_id == self._home_channel_id:
+            persona_id = self._reply_persona.get(raw_chat_id, persona_id)
+        if persona_id is None or not self.mux.has(persona_id):
+            persona_id = self.mux.default_persona
+        return persona_id, raw_chat_id
+
+    async def _send_attachment(self, chat_id, file_path, caption=None,
+                               file_name=None):  # pragma: no cover - needs live env
+        """Upload a local file as a native Discord attachment via the right persona.
+
+        The brain emits ``MEDIA:<path>`` (or a bare artifact path) in its reply;
+        Hermes extracts + security-validates those and dispatches them to the
+        ``send_*`` methods below, so a file the agent produced — a CSV export, a
+        chart, a PDF — arrives as a real downloadable attachment instead of an
+        undownloadable container path. The file is sent by the same persona that
+        delivered the reply (see :meth:`_persona_for_outbound`).
+        """
+        persona_id, raw_chat_id = self._persona_for_outbound(chat_id)
+        client = self._clients.get(persona_id)
+        if client is None:
+            return SendResult(success=False, error=f"persona '{persona_id}' is not online")
+        try:
+            channel = client.get_channel(int(raw_chat_id))
+            if channel is None:
+                channel = await client.fetch_channel(int(raw_chat_id))
+        except Exception as exc:  # noqa: BLE001
+            return SendResult(success=False, error=f"channel {raw_chat_id} unreachable: {exc}")
+        caption = (caption or "").strip() or None
+        try:
+            filename = file_name or os.path.basename(file_path)
+            with open(file_path, "rb") as fh:
+                msg = await channel.send(content=caption, file=discord.File(fh, filename=filename))
+        except FileNotFoundError:
+            return SendResult(success=False, error=f"file not found: {file_path}")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[%s] attachment send failed for persona '%s': %s",
+                         PLATFORM_NAME, persona_id, exc)
+            return SendResult(success=False, error=str(exc))
+        return SendResult(success=True, message_id=str(msg.id),
+                          raw_response={"message_id": str(msg.id), "persona": persona_id})
+
+    async def send_document(self, chat_id, file_path, caption=None, file_name=None,
+                            reply_to=None, metadata=None):  # pragma: no cover - needs live env
+        """Deliver an arbitrary file (CSV, PDF, …) as a native attachment."""
+        return await self._send_attachment(chat_id, file_path, caption, file_name)
+
+    async def send_image_file(self, chat_id, image_path, caption=None, reply_to=None,
+                              metadata=None, **kwargs):  # pragma: no cover - needs live env
+        """Deliver a local image file; Discord renders attachments inline."""
+        return await self._send_attachment(chat_id, image_path, caption)
+
+    async def send_video(self, chat_id, video_path, caption=None, reply_to=None,
+                         metadata=None, **kwargs):  # pragma: no cover - needs live env
+        """Deliver a local video as a native, inline-playable attachment."""
+        return await self._send_attachment(chat_id, video_path, caption)
+
+    async def send_voice(self, chat_id, audio_path, caption=None, reply_to=None,
+                        metadata=None, **kwargs):  # pragma: no cover - needs live env
+        """Deliver an audio file as an attachment (bot accounts can't post voice notes)."""
+        return await self._send_attachment(chat_id, audio_path, caption)
+
     async def get_chat_info(self, chat_id):  # pragma: no cover - needs live env
         _, raw = decode_chat_id(str(chat_id))
         return {"name": raw, "type": "dm"}
@@ -500,14 +571,10 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         reply is sent). Keyed by the persona-namespaced ``chat_id``.
         """
         key = str(chat_id)
-        persona_id, raw_chat_id = decode_chat_id(key)
         # Shared channel: type as the persona slated to reply once known (set from a
         # `[next:]` ack hint or a `[persona:]` reply); until then the orchestrator —
         # who sends the ack — is the typer. DMs always type as the addressed persona.
-        if self._home_channel_id and raw_chat_id == self._home_channel_id:
-            persona_id = self._reply_persona.get(raw_chat_id, persona_id)
-        if persona_id is None or not self.mux.has(persona_id):
-            persona_id = self.mux.default_persona
+        persona_id, raw_chat_id = self._persona_for_outbound(key)
         # Already showing this persona's indicator for this chat — nothing to do.
         if self._typing_persona.get(key) == persona_id and key in self._typing_tasks:
             return
