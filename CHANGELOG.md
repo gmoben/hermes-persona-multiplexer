@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/gmoben/hermes-persona-multiplexer/compare/v0.3.0...v0.4.0) (2026-05-31)
+
+
+### Features
+
+* orchestrator sends a quick ack before the slow work (shared channel) ([71d9d0c](https://github.com/gmoben/hermes-persona-multiplexer/commit/71d9d0c7cca6d27fbe1faed5aa78ef568b0e0bb7))
+
 ## [0.3.0](https://github.com/gmoben/hermes-persona-multiplexer/compare/v0.2.0...v0.3.0) (2026-05-31)
 
 
