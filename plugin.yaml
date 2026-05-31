@@ -3,21 +3,18 @@ label: Discord Personas
 kind: platform
 version: 0.1.0
 description: >
-  One Hermes brain, many Discord faces. Connects N Discord bot accounts through a
-  single gateway process into one shared-brain agent; the persona is chosen by
+  One Hermes brain, many Discord faces. Connects N Discord bot accounts through
+  a single gateway process into one shared-brain agent; the persona is chosen by
   which bot account received the message. DMs and channel messages reply as the
   right identity — no webhooks, no separate processes, one shared memory.
 author: gmoben
 license: MIT
 homepage: https://github.com/gmoben/hermes-persona-multiplexer
-
-# Authorization is shared across every persona (the brain is one agent).
 requires_env:
   - name: DISCORD_PERSONAS_ALLOWED_USERS
     description: Comma-separated Discord user IDs allowed to talk to any persona
     prompt: Allowed Discord user IDs (comma-separated)
     password: false
-
 optional_env:
   - name: DISCORD_PERSONAS_HOME_CHANNEL
     description: Default channel ID for cron / proactive delivery
@@ -27,6 +24,3 @@ optional_env:
     description: Set to 1 to allow every Discord user (NOT recommended)
     prompt: Allow all users? (1/0)
     password: false
-# NOTE: per-persona bot tokens are dynamic — one per persona, referenced by the
-# `token_env` field in config.yaml (e.g. DISCORD_TOKEN_ALEX). They are not
-# listed here because they vary per deployment.
