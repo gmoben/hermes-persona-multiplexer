@@ -15,10 +15,13 @@ from dataclasses import dataclass
 #: Platform name registered with the Hermes gateway.
 PLATFORM_NAME = "discord_personas"
 
-#: Reply-routing tag the brain emits at the very start of a shared-channel reply
-#: to choose which persona's bot account delivers it, e.g. ``[persona:<id>] ...``.
-#: Parsed + stripped by the adapter's send path (see :func:`extract_reply_persona`).
-_REPLY_TAG_RE = re.compile(r"^\s*\[persona:\s*([A-Za-z0-9_-]+)\s*\]\s*")
+#: Leading tags the brain emits on a shared-channel message:
+#:   ``[persona:<id>]`` — which persona's bot account delivers this reply.
+#:   ``[next:<id>]``    — typing hint: who will deliver the upcoming reply (lets the
+#:                        orchestrator's quick ack switch the typing indicator to the
+#:                        answering persona without changing who sends the ack).
+#: Both are parsed + stripped by the adapter's send path (see
+#: :func:`extract_reply_persona` / :func:`extract_next_persona`).
 
 
 class ConfigError(ValueError):
@@ -207,26 +210,38 @@ def decide_inbound(
     return ProcessDecision(True, "ok-channel", recipient_persona)
 
 
-def extract_reply_persona(
-    content: str, valid_ids: Iterable[str]
+def _extract_leading_persona_tag(
+    content: str, keyword: str, valid_ids: Iterable[str]
 ) -> tuple[str | None, str]:
-    """Pull a leading ``[persona:<id>]`` routing tag off an outbound reply.
+    """Pull a leading ``[<keyword>:<id>]`` tag naming a known persona.
 
-    Returns ``(persona_id, content_without_tag)`` when the reply starts with a
-    tag naming a known persona; otherwise ``(None, content)`` unchanged. Lets the
-    shared-brain choose which persona's bot delivers a shared-channel reply.
+    Returns ``(persona_id, content_without_tag)`` on a match, else ``(None, content)``
+    unchanged (an unknown persona is left untouched).
     """
     if not content:
         return None, content
-    m = _REPLY_TAG_RE.match(content)
+    m = re.match(rf"^\s*\[{keyword}:\s*([A-Za-z0-9_-]+)\s*\]\s*", content)
     if not m:
         return None, content
-    tag = m.group(1).strip()
     canonical = {str(v).lower(): str(v) for v in valid_ids}
-    resolved = canonical.get(tag.lower())
+    resolved = canonical.get(m.group(1).strip().lower())
     if resolved is None:
-        return None, content  # unknown persona — leave the text untouched
+        return None, content
     return resolved, content[m.end():]
+
+
+def extract_reply_persona(content: str, valid_ids: Iterable[str]) -> tuple[str | None, str]:
+    """``[persona:<id>]`` — which persona's bot account delivers this reply."""
+    return _extract_leading_persona_tag(content, "persona", valid_ids)
+
+
+def extract_next_persona(content: str, valid_ids: Iterable[str]) -> tuple[str | None, str]:
+    """``[next:<id>]`` — typing hint naming who will deliver the upcoming reply.
+
+    The orchestrator's quick ack uses this so the typing indicator switches to the
+    answering persona while the ack text itself is still delivered by the orchestrator.
+    """
+    return _extract_leading_persona_tag(content, "next", valid_ids)
 
 
 def resolve_outbound_persona(

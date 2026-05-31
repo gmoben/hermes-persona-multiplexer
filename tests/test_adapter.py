@@ -42,6 +42,8 @@ def _make_adapter(monkeypatch, own=()):  # bypass BasePlatformAdapter.__init__
     ad._own_account_ids = set(own)
     ad._account_to_persona = {}
     ad._home_channel_id = None
+    ad._reply_persona = {}
+    ad._typing_persona = {}
     ad.handled = []
     ad.build_source = lambda **kw: kw  # SessionSource stand-in: the kwargs dict
     async def _handle(event):
@@ -139,10 +141,10 @@ def test_on_inbound_channel_orchestrator_intakes(monkeypatch):
     )
     assert len(ad.handled) == 1
     ev = ad.handled[0]
-    # shared-channel prompt instructs a quick (untagged) ack, then the routing tag,
+    # shared-channel prompt instructs the quick ack's typing hint + the reply tag,
     # and namespaces the session to the orchestrator
     assert "[persona:" in ev.channel_prompt
-    assert "no persona tag" in ev.channel_prompt.lower()
+    assert "[next:" in ev.channel_prompt
     assert ev.source["chat_id"] == "p!alex!777"
 
 

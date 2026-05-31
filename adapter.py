@@ -25,6 +25,7 @@ from .routing import (
     PLATFORM_NAME,
     MultiplexerConfig,
     decide_inbound,
+    extract_next_persona,
     extract_reply_persona,
     parse_config,
     resolve_outbound_persona,
@@ -104,10 +105,11 @@ def shared_channel_prompt(personas, orchestrator_id: str) -> str:
     """Per-message system prompt for the shared channel — fast ack, then route the reply.
 
     All personas live in the shared channel but the message reaches the brain once
-    (via the orchestrator). For snappy UX the brain first sends a one-line
-    acknowledgment as the orchestrator (an untagged interim message), then does the
-    work and sends its full answer starting with a ``[persona:<id>]`` tag, which the
-    send path consumes to deliver through the chosen persona's bot account.
+    (via the orchestrator). For snappy UX the brain first sends a one-line ack as the
+    orchestrator carrying a ``[next:<id>]`` hint (which moves the typing indicator to
+    the answering persona without changing who sends the ack), then does the work and
+    sends its full answer starting with a ``[persona:<id>]`` tag, which the send path
+    consumes to deliver through the chosen persona's bot account.
     """
     roster = ", ".join(
         f"`{p.id}`" + (f" ({p.display_name})" if p.display_name else "") for p in personas
@@ -115,15 +117,16 @@ def shared_channel_prompt(personas, orchestrator_id: str) -> str:
     return (
         "This is the shared channel where all your personas live — one brain, many "
         "Discord faces. Respond in two steps:\n"
-        "1. Right away, send ONE short line as the orchestrator (no persona tag) saying "
-        'what you are about to do, so the user is not left waiting (e.g. "On it — '
-        'looking into that now…").\n'
+        "1. Right away, send ONE short orchestrator line that begins with a `[next:<id>]` "
+        "tag naming who will answer, then a brief note of what you're doing — e.g. "
+        '"[next:<id>] On it — looking into that now…". The `[next:]` tag only moves the '
+        "typing indicator to that persona; the line itself is still sent by you, the "
+        "orchestrator.\n"
         "2. Then do the work and send your full answer, starting it with a `[persona:<id>]` "
         "tag naming the single persona who should respond.\n"
         "Personas: " + roster + f". Use the orchestrator `{orchestrator_id}` for general, "
-        "multi-topic, or coordination messages. Put exactly one tag at the very start of "
-        "the final answer, speak only in that persona's voice, and never @-mention the "
-        "other bots (it loops)."
+        "multi-topic, or coordination messages. Speak only in the chosen persona's voice, "
+        "and never @-mention the other bots (it loops)."
     )
 
 
@@ -146,6 +149,10 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         self._account_to_persona: dict[str, str] = {}      # bot user id -> persona id
         self._tokens: dict[str, str] = {}                  # persona_id -> token value
         self._typing_tasks: dict[str, asyncio.Task] = {}   # chat_id -> typing-loop task
+        self._typing_persona: dict[str, str] = {}          # chat_id -> persona currently typing
+        # Shared-channel only: the persona slated to deliver the reply, set from a
+        # `[next:<id>]` ack hint or a `[persona:<id>]` reply so typing follows them.
+        self._reply_persona: dict[str, str] = {}           # raw_chat_id -> persona
         # Shared home channel (cron + content-led inbound); None disables channel intake.
         self._home_channel_id: str | None = (
             os.getenv("DISCORD_PERSONAS_HOME_CHANNEL", "").strip() or None
@@ -309,6 +316,9 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
             await self._close_persona(persona_id)
         self.locks.release_all()
         self._own_account_ids.clear()
+        self._account_to_persona.clear()
+        self._reply_persona.clear()
+        self._typing_persona.clear()
         self._mark_disconnected()
 
     # -- inbound -----------------------------------------------------------
@@ -334,6 +344,11 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         if not decision.process:
             logger.debug("[%s] dropping message (%s)", PLATFORM_NAME, decision.reason)
             return None
+
+        if not is_dm:
+            # New shared-channel turn: type as the orchestrator (who sends the ack)
+            # until the ack's `[next:]` hint names the answering persona.
+            self._reply_persona.pop(raw_chat_id, None)
 
         persona = self.mux.persona(recipient_persona)
         # DMs are owned by the addressed persona; shared-channel messages are
@@ -367,9 +382,22 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         """Route an outbound message through the correct persona's client."""
         metadata = metadata or {}
         inbound_persona, raw_chat_id = decode_chat_id(str(chat_id))
-        # A shared-channel reply may begin with a `[persona:<id>]` routing tag the
-        # brain chose; it wins over the inbound persona and is stripped from the text.
-        tag_persona, content = extract_reply_persona(str(content), self.mux.ids)
+        content = str(content)
+        # A `[next:<id>]` hint (on the orchestrator's quick ack) doesn't change who
+        # sends THIS message — it points the typing indicator at the persona who will
+        # deliver the follow-up reply, so typing switches off the orchestrator.
+        next_persona, content = extract_next_persona(content, self.mux.ids)
+        if next_persona:
+            self._reply_persona[raw_chat_id] = next_persona
+            await self.send_typing(str(chat_id))
+        # A `[persona:<id>]` tag chooses which persona delivers THIS reply; it wins
+        # over the inbound persona and is stripped from the text.
+        tag_persona, content = extract_reply_persona(content, self.mux.ids)
+        if tag_persona:
+            self._reply_persona[raw_chat_id] = tag_persona
+        if not content.strip():
+            # Pure control line (e.g. a bare `[next:]` hint) — nothing to deliver.
+            return SendResult(success=True, message_id=None, raw_response={"control_only": True})
         try:
             persona_id = resolve_outbound_persona(
                 explicit=tag_persona or metadata.get("persona"),
@@ -421,11 +449,23 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         """
         key = str(chat_id)
         persona_id, raw_chat_id = decode_chat_id(key)
+        # Shared channel: type as the persona slated to reply once known (set from a
+        # `[next:]` ack hint or a `[persona:]` reply); until then the orchestrator —
+        # who sends the ack — is the typer. DMs always type as the addressed persona.
+        if self._home_channel_id and raw_chat_id == self._home_channel_id:
+            persona_id = self._reply_persona.get(raw_chat_id, persona_id)
         if persona_id is None or not self.mux.has(persona_id):
             persona_id = self.mux.default_persona
-        client = self._clients.get(persona_id)
-        if client is None or key in self._typing_tasks:
+        # Already showing this persona's indicator for this chat — nothing to do.
+        if self._typing_persona.get(key) == persona_id and key in self._typing_tasks:
             return
+        # First time, or the answering persona changed → (re)start on the new client.
+        if key in self._typing_tasks:
+            await self.stop_typing(key)
+        client = self._clients.get(persona_id)
+        if client is None:
+            return
+        self._typing_persona[key] = persona_id
 
         async def _typing_loop():
             try:
@@ -445,10 +485,12 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
                 pass
             finally:
                 self._typing_tasks.pop(key, None)
+                self._typing_persona.pop(key, None)
 
         self._typing_tasks[key] = asyncio.create_task(_typing_loop())
 
     async def stop_typing(self, chat_id):  # pragma: no cover - needs live env
+        self._typing_persona.pop(str(chat_id), None)
         task = self._typing_tasks.pop(str(chat_id), None)
         if task is not None:
             task.cancel()

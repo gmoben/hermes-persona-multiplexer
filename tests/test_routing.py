@@ -198,3 +198,19 @@ def test_extract_reply_persona(content, expected_persona, expected_text):
     persona, text = r.extract_reply_persona(content, ("alex", "sam"))
     assert persona == expected_persona
     assert text == expected_text
+
+
+@pytest.mark.parametrize(
+    "content, expected_persona, expected_text",
+    [
+        ("[next:sam] On it — looking…", "sam", "On it — looking…"),
+        ("[next:Alex] one sec", "alex", "one sec"),
+        ("no hint here", None, "no hint here"),
+        ("[next:ghost] unknown stays", None, "[next:ghost] unknown stays"),
+        ("[persona:sam] not a next tag", None, "[persona:sam] not a next tag"),
+    ],
+)
+def test_extract_next_persona(content, expected_persona, expected_text):
+    persona, text = r.extract_next_persona(content, ("alex", "sam"))
+    assert persona == expected_persona
+    assert text == expected_text
