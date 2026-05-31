@@ -15,10 +15,10 @@ ruff check .
 
 Keep the decision logic free of Hermes/`discord.py` imports:
 
-- `discord_personas/routing.py` and `discord_personas/locks.py` are **pure** —
+- `routing.py` and `locks.py` are **pure** —
   no `gateway.*`, no `discord` imports. This is what makes the core unit-testable
   in CI without a Hermes install.
-- `discord_personas/adapter.py` holds all Hermes/discord wiring. Its Hermes
+- `adapter.py` holds all Hermes/discord wiring. Its Hermes
   imports are guarded so the module still imports for `register()` tests.
 
 If you add behavior, put the *decision* in `routing.py` (with tests) and the

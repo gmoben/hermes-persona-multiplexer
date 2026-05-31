@@ -43,14 +43,14 @@ account. See [README.md](README.md) for the user‑facing description.
 ## Repository Structure
 
 ```
-├── discord_personas/
-│   ├── routing.py      # PURE decision core — no Hermes/discord imports (tested)
-│   ├── locks.py        # PURE scoped-lock manager + graceful degradation (tested)
-│   ├── adapter.py      # Hermes/discord wiring; guarded imports; register() entry point
-│   └── __init__.py     # version + lazy register()
-├── tests/              # pytest; runs with zero Hermes/discord deps
+├── __init__.py         # register() entry point + version (flat plugin root)
+├── routing.py          # PURE decision core — no Hermes/discord imports (tested)
+├── locks.py            # PURE scoped-lock manager + graceful degradation (tested)
+├── adapter.py          # Hermes/discord live wiring (connect/send/typing); guarded imports
+├── conftest.py         # loads the flat package for tests (mirrors Hermes's dir loader)
+├── tests/              # pytest; pure core runs with zero Hermes/discord deps
 ├── examples/config.yaml
-├── plugin.yaml         # kind: platform manifest (version = source of truth)
+├── plugin.yaml         # kind: platform manifest (name: hermes-persona-multiplexer)
 ├── docs/spike.md       # the two-account validation plan
 ├── release-please-config.json + .release-please-manifest.json
 └── .github/            # workflows/ (ci.yml lint+test, release.yml release-please),
@@ -85,7 +85,7 @@ New behavior → put the *decision* in `routing.py` (with a test), the *I/O* in
 
 SemVer; **release-please** owns the whole flow — version, tag, GitHub Release,
 `CHANGELOG.md`, and version sync into `plugin.yaml` / `pyproject.toml` /
-`discord_personas/__init__.py`. You don't bump versions or edit the changelog by
+`__init__.py`. You don't bump versions or edit the changelog by
 hand; just write Conventional Commits and merge the release PR. Full rules and the
 Hermes‑compatibility recording requirement are in [RELEASING.md](RELEASING.md).
 

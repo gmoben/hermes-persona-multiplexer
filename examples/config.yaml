@@ -5,7 +5,7 @@
 #
 #   plugins:
 #     enabled:
-#       - discord-personas
+#       - hermes-persona-multiplexer
 #
 # Then: hermes gateway restart
 

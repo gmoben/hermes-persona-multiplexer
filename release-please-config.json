@@ -10,7 +10,7 @@
       "extra-files": [
         { "type": "yaml", "path": "plugin.yaml", "jsonpath": "$.version" },
         { "type": "toml", "path": "pyproject.toml", "jsonpath": "$.project.version" },
-        { "type": "generic", "path": "discord_personas/__init__.py" }
+        { "type": "generic", "path": "__init__.py" }
       ],
       "changelog-sections": [
         { "type": "feat", "section": "Features" },
@@ -26,5 +26,5 @@
     }
   },
   "changelog-path": "CHANGELOG.md",
-  "comment": "release-please owns version, tag, GitHub Release, CHANGELOG.md, and version sync via extra-files. The discord_personas/__init__.py version line carries an x-release-please-version annotation for the generic updater."
+  "comment": "release-please owns version, tag, GitHub Release, CHANGELOG.md, and version sync via extra-files. The __init__.py version line carries an x-release-please-version annotation for the generic updater."
 }

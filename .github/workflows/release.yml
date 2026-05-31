@@ -3,7 +3,7 @@ name: Release
 # release-please owns the entire release flow: it derives the next SemVer from
 # Conventional Commits, opens/maintains a release PR, and on merge it tags the
 # release, creates the GitHub Release, updates CHANGELOG.md, and syncs the version
-# into plugin.yaml / pyproject.toml / discord_personas/__init__.py (extra-files).
+# into plugin.yaml / pyproject.toml / __init__.py (extra-files).
 # See RELEASING.md.
 
 on:

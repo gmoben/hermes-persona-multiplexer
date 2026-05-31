@@ -26,7 +26,7 @@ shared memory). Prove:
 - A Hermes install (dev channel) with the bundled Discord adapter present
   (`plugins/platforms/discord/adapter.py`).
 - Two Discord applications + bot tokens (Message Content + Server Members intents).
-- This plugin enabled: `plugins.enabled: [discord-personas]`.
+- This plugin enabled: `plugins.enabled: [hermes-persona-multiplexer]`.
 - `~/.hermes/.env`: `DISCORD_TOKEN_ALEX`, `DISCORD_TOKEN_SAM`,
   `DISCORD_PERSONAS_ALLOWED_USERS=<your id>`, `DISCORD_ALLOW_BOTS=none`.
 

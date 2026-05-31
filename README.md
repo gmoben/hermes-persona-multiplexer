@@ -57,7 +57,7 @@ Enable it and configure personas in `~/.hermes/config.yaml` (see
 
 ```yaml
 plugins:
-  enabled: [discord-personas]
+  enabled: [hermes-persona-multiplexer]
 
 gateway:
   platforms:

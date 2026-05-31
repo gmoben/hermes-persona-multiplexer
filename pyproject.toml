@@ -28,7 +28,9 @@ Issues = "https://github.com/gmoben/hermes-persona-multiplexer/issues"
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
-addopts = "-q"
+# importlib mode: import test modules by path without the rootdir package-walk,
+# which otherwise trips on the plugin-root __init__.py (the shim Hermes loads).
+addopts = "-q --import-mode=importlib"
 
 [tool.ruff]
 line-length = 100

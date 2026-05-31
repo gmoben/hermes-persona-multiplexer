@@ -7,7 +7,7 @@ next version from Conventional Commits, maintains a release PR, and on merge it:
 - creates the git **tag** and the **GitHub Release**,
 - updates **`CHANGELOG.md`**,
 - syncs the version into **`plugin.yaml`**, **`pyproject.toml`**, and
-  **`discord_personas/__init__.py`** (via `extra-files`; the `__init__.py` line
+  **`__init__.py`** (via `extra-files`; the `__init__.py` line
   carries an `x-release-please-version` annotation for the generic updater).
 
 You don't bump versions or edit the changelog by hand — just write good commit
