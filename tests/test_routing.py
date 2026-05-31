@@ -214,3 +214,28 @@ def test_extract_next_persona(content, expected_persona, expected_text):
     persona, text = r.extract_next_persona(content, ("alex", "sam"))
     assert persona == expected_persona
     assert text == expected_text
+
+
+@pytest.mark.parametrize(
+    "content, persona, before, after",
+    [
+        # leading tag: nothing before, reply follows
+        ("[persona:sam] hello", "sam", "", "hello"),
+        # case-insensitive id resolves to canonical; surrounding whitespace tolerated
+        ("[persona:Alex] hi", "alex", "", "hi"),
+        ("[persona: sam ] hi", "sam", "", "hi"),
+        # mid-message: the brain bundled an orchestrator ack ahead of the tagged reply,
+        # so `before` carries the ack and `after` the persona's reply (tag stripped)
+        ("[next:sam] On it\n\n[persona:sam] here you go", "sam",
+         "[next:sam] On it\n\n", "here you go"),
+        # no tag -> all text is `before`, `after` empty
+        ("just a normal reply", None, "just a normal reply", ""),
+        # unknown persona is left untouched
+        ("[persona:ghost] nope", None, "[persona:ghost] nope", ""),
+        ("", None, "", ""),
+        # first KNOWN persona wins; an unknown tag ahead of it stays in `before`
+        ("[persona:ghost] x [persona:sam] y", "sam", "[persona:ghost] x ", "y"),
+    ],
+)
+def test_split_reply_persona(content, persona, before, after):
+    assert r.split_reply_persona(content, ("alex", "sam")) == (persona, before, after)

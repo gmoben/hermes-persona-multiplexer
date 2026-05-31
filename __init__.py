@@ -31,6 +31,7 @@ try:
         parse_config,
         persona_metadata,
         resolve_outbound_persona,
+        split_reply_persona,
     )
 except ImportError:  # imported standalone, no parent package
     from routing import (  # type: ignore[no-redef]
@@ -45,6 +46,7 @@ except ImportError:  # imported standalone, no parent package
         parse_config,
         persona_metadata,
         resolve_outbound_persona,
+        split_reply_persona,
     )
 
 __all__ = [
@@ -60,6 +62,7 @@ __all__ = [
     "parse_config",
     "persona_metadata",
     "resolve_outbound_persona",
+    "split_reply_persona",
     "register",
 ]
 

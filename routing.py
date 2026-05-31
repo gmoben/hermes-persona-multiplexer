@@ -244,6 +244,27 @@ def extract_next_persona(content: str, valid_ids: Iterable[str]) -> tuple[str | 
     return _extract_leading_persona_tag(content, "next", valid_ids)
 
 
+def split_reply_persona(
+    content: str, valid_ids: Iterable[str]
+) -> tuple[str | None, str, str]:
+    """Locate a ``[persona:<id>]`` tag anywhere in the reply and split around it.
+
+    Returns ``(persona_id, before, after)`` where ``before`` is the text preceding
+    the tag (e.g. an orchestrator ack the brain bundled into the same message) and
+    ``after`` is the persona's actual reply (tag removed). Returns ``(None, content, "")``
+    when no tag naming a known persona is present. Unlike :func:`extract_reply_persona`
+    (leading-only), this catches the tag even mid-message so it never leaks to the user.
+    """
+    if not content:
+        return None, content, ""
+    canonical = {str(v).lower(): str(v) for v in valid_ids}
+    for m in re.finditer(r"\[persona:\s*([A-Za-z0-9_-]+)\s*\]", content):
+        resolved = canonical.get(m.group(1).strip().lower())
+        if resolved is not None:
+            return resolved, content[: m.start()], content[m.end():].lstrip("\n ")
+    return None, content, ""
+
+
 def resolve_outbound_persona(
     *,
     explicit: str | None,

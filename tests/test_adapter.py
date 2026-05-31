@@ -36,7 +36,8 @@ class _Event:
 
 def _make_adapter(monkeypatch, own=()):  # bypass BasePlatformAdapter.__init__
     monkeypatch.setattr(a, "MessageEvent", _Event, raising=False)
-    monkeypatch.setattr(a, "MessageType", type("MT", (), {"TEXT": "text"}), raising=False)
+    monkeypatch.setattr(a, "MessageType",
+                        type("MT", (), {"TEXT": "text", "PHOTO": "photo"}), raising=False)
     ad = a.DiscordPersonasAdapter.__new__(a.DiscordPersonasAdapter)
     ad.mux = _cfg()
     ad._own_account_ids = set(own)
@@ -114,6 +115,39 @@ def test_on_inbound_unknown_persona_is_dropped(monkeypatch):
         )
     )
     assert ad.handled == []
+
+
+def test_on_inbound_forwards_image_media(monkeypatch):
+    ad = _make_adapter(monkeypatch)
+    asyncio.run(
+        ad._on_inbound(
+            recipient_persona="alex", author_account_id="u1", raw_chat_id="42",
+            text="what's this?", message_id="1", chat_type="dm",
+            chat_name="user", user_name="user",
+            media_urls=["/cache/img/abc.jpg"], media_types=["image/jpeg"],
+        )
+    )
+    assert len(ad.handled) == 1
+    ev = ad.handled[0]
+    # cached image path + type flow through to the brain, and the presence of media
+    # promotes the event to PHOTO so the vision pipeline picks it up
+    assert ev.media_urls == ["/cache/img/abc.jpg"]
+    assert ev.media_types == ["image/jpeg"]
+    assert ev.message_type == "photo"
+
+
+def test_on_inbound_text_only_has_empty_media(monkeypatch):
+    ad = _make_adapter(monkeypatch)
+    asyncio.run(
+        ad._on_inbound(
+            recipient_persona="alex", author_account_id="u1", raw_chat_id="42",
+            text="hi", message_id="1", chat_type="dm",
+            chat_name="user", user_name="user",
+        )
+    )
+    ev = ad.handled[0]
+    assert ev.media_urls == [] and ev.media_types == []
+    assert ev.message_type == "text"
 
 
 @pytest.mark.parametrize(

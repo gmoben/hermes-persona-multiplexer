@@ -26,9 +26,9 @@ from .routing import (
     MultiplexerConfig,
     decide_inbound,
     extract_next_persona,
-    extract_reply_persona,
     parse_config,
     resolve_outbound_persona,
+    split_reply_persona,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,6 +48,8 @@ try:  # pragma: no cover - exercised only inside a Hermes install
         MessageEvent,
         MessageType,
         SendResult,
+        cache_image_from_bytes,
+        cache_image_from_url,
     )
 
     _HERMES_AVAILABLE = True
@@ -213,6 +215,23 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
                     text = text.replace(f"<@{um.id}>", f"@{label}").replace(
                         f"<@!{um.id}>", f"@{label}"
                     )
+            # Cache image attachments to local paths so the brain can see them
+            # (vision). Without this, photos (e.g. a meal snapshot) are dropped.
+            media_urls: list[str] = []
+            media_types: list[str] = []
+            for att in getattr(message, "attachments", None) or []:
+                ctype = getattr(att, "content_type", None) or ""
+                if not ctype.startswith("image/"):
+                    continue
+                ext = "." + ctype.split("/")[-1].split(";")[0]
+                if ext not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
+                    ext = ".jpg"
+                try:
+                    media_urls.append(await adapter._cache_image(att, ext))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[%s] image cache failed (%s); using URL", PLATFORM_NAME, exc)
+                    media_urls.append(att.url)
+                media_types.append(ctype)
             await adapter._on_inbound(
                 recipient_persona=pid,
                 author_account_id=str(message.author.id),
@@ -229,9 +248,23 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
                 or getattr(message.author, "name", None),
                 guild_id=str(guild.id) if guild else None,
                 is_bot=bool(getattr(message.author, "bot", False)),
+                media_urls=media_urls,
+                media_types=media_types,
             )
 
         return client
+
+    async def _cache_image(self, att, ext: str) -> str:  # pragma: no cover - needs live env
+        """Download an image attachment to the local cache; return its path.
+
+        Mirrors the bundled Discord adapter: prefer the raw bytes (att.read), fall
+        back to the CDN URL (SSRF-gated by Hermes's cache_image_from_url).
+        """
+        try:
+            raw = await att.read()
+            return cache_image_from_bytes(raw, ext=ext)
+        except Exception:  # noqa: BLE001
+            return await cache_image_from_url(att.url, ext=ext)
 
     async def connect(self) -> bool:  # pragma: no cover - needs live env
         """Start one Discord client per persona; degrade per-persona on failure."""
@@ -325,7 +358,9 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
     async def _on_inbound(self, *, recipient_persona: str, author_account_id: str | None,
                           raw_chat_id: str, text: str, message_id: str | None,
                           chat_type: str, chat_name: str | None, user_name: str | None,
-                          guild_id: str | None = None, is_bot: bool = False):
+                          guild_id: str | None = None, is_bot: bool = False,
+                          media_urls: list[str] | None = None,
+                          media_types: list[str] | None = None):
         """Normalize a Discord message into a persona-tagged ``MessageEvent``.
 
         Loop prevention + persona resolution live in the pure core
@@ -368,50 +403,67 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
             guild_id=guild_id,
             message_id=message_id,
         )
+        media_urls = media_urls or []
+        media_types = media_types or []
+        msg_type = MessageType.TEXT
+        if media_urls:
+            msg_type = getattr(MessageType, "PHOTO", MessageType.TEXT)
         event = MessageEvent(
             text=text,
-            message_type=MessageType.TEXT,
+            message_type=msg_type,
             source=source,
             message_id=message_id,
             channel_prompt=channel_prompt,
+            media_urls=media_urls,
+            media_types=media_types,
         )
         return await self.handle_message(event)  # type: ignore[attr-defined]
 
     # -- outbound ----------------------------------------------------------
     async def send(self, chat_id, content, reply_to=None, metadata=None):  # pragma: no cover
-        """Route an outbound message through the correct persona's client."""
+        """Route an outbound message through the correct persona's client.
+
+        Handles three leading/embedded tags the brain may emit:
+        - `[next:<id>]` (leading) — typing hint; doesn't change who sends this message.
+        - `[persona:<id>]` — which persona delivers the reply. It may appear mid-message
+          when the brain bundles an orchestrator ack and the reply together; we split at
+          it so the ack goes out as the orchestrator and the reply as the persona, and
+          the tag never leaks to the user.
+        """
         metadata = metadata or {}
         inbound_persona, raw_chat_id = decode_chat_id(str(chat_id))
         content = str(content)
-        # A `[next:<id>]` hint (on the orchestrator's quick ack) doesn't change who
-        # sends THIS message — it points the typing indicator at the persona who will
-        # deliver the follow-up reply, so typing switches off the orchestrator.
+
         next_persona, content = extract_next_persona(content, self.mux.ids)
         if next_persona:
             self._reply_persona[raw_chat_id] = next_persona
             await self.send_typing(str(chat_id))
-        # A `[persona:<id>]` tag chooses which persona delivers THIS reply; it wins
-        # over the inbound persona and is stripped from the text.
-        tag_persona, content = extract_reply_persona(content, self.mux.ids)
-        if tag_persona:
-            self._reply_persona[raw_chat_id] = tag_persona
-        if not content.strip():
-            # Pure control line (e.g. a bare `[next:]` hint) — nothing to deliver.
-            return SendResult(success=True, message_id=None, raw_response={"control_only": True})
+
         try:
-            persona_id = resolve_outbound_persona(
-                explicit=tag_persona or metadata.get("persona"),
-                inbound=inbound_persona,
-                config=self.mux,
-            )
+            inbound_target = resolve_outbound_persona(
+                explicit=metadata.get("persona"), inbound=inbound_persona, config=self.mux)
         except KeyError as exc:
             return SendResult(success=False, error=str(exc))
 
+        reply_persona, before, after = split_reply_persona(content, self.mux.ids)
+        if reply_persona:
+            self._reply_persona[raw_chat_id] = reply_persona
+            # Text before the tag (e.g. a bundled orchestrator ack) is delivered by the
+            # inbound/orchestrator persona; the reply itself by the tagged persona.
+            if before.strip():
+                await self._deliver(raw_chat_id, before, inbound_target)
+            return await self._deliver(raw_chat_id, after, reply_persona)
+
+        return await self._deliver(raw_chat_id, content, inbound_target)
+
+    async def _deliver(self, raw_chat_id, content, persona_id):  # pragma: no cover - needs live env
+        """Send already-resolved content to a chat through a specific persona's client."""
+        if not str(content).strip():
+            return SendResult(success=True, message_id=None, raw_response={"control_only": True})
         client = self._clients.get(persona_id)
         if client is None:
             return SendResult(success=False, message_id=None,
                               error=f"persona '{persona_id}' is not online")
-
         try:
             channel = client.get_channel(int(raw_chat_id))
             if channel is None:
@@ -528,7 +580,9 @@ async def standalone_send(pconfig, chat_id, message, *, thread_id=None,
     inbound_persona, raw_chat_id = decode_chat_id(str(chat_id))
     # Let a cron job pick its persona with a leading `[persona:<id>]` tag (e.g. a
     # scheduled report delivers as a specific persona); else fall back to the chat's persona.
-    tag_persona, message = extract_reply_persona(str(message), mux.ids)
+    tag_persona, before, after = split_reply_persona(str(message), mux.ids)
+    if tag_persona:
+        message = (before + after).strip()
     persona_id = resolve_outbound_persona(explicit=tag_persona, inbound=inbound_persona, config=mux)
     persona = mux.persona(persona_id)
     token = os.getenv(persona.token_env, "").strip()
