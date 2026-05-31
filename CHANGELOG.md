@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/gmoben/hermes-persona-multiplexer/compare/v0.4.0...v0.4.1) (2026-05-31)
+
+
+### Bug Fixes
+
+* typing indicator follows the answering persona, not the orchestrator ([42fb032](https://github.com/gmoben/hermes-persona-multiplexer/commit/42fb032f367a337a80623048c6b7bb29b7478e05))
+
 ## [0.4.0](https://github.com/gmoben/hermes-persona-multiplexer/compare/v0.3.0...v0.4.0) (2026-05-31)
 
 
