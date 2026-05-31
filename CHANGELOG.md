@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2](https://github.com/gmoben/hermes-persona-multiplexer/compare/v0.4.1...v0.4.2) (2026-05-31)
+
+
+### Bug Fixes
+
+* forward image attachments and split mid-message [persona:] tags ([c9ff7b3](https://github.com/gmoben/hermes-persona-multiplexer/commit/c9ff7b347ffa76e7c6a50b622701887e0ea87d20))
+
 ## [0.4.1](https://github.com/gmoben/hermes-persona-multiplexer/compare/v0.4.0...v0.4.1) (2026-05-31)
 
 
