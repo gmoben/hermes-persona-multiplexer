@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/gmoben/hermes-persona-multiplexer/compare/v0.2.0...v0.3.0) (2026-05-31)
+
+
+### Features
+
+* content-led shared-channel routing (orchestrator intake + reply tags) ([b8b71fc](https://github.com/gmoben/hermes-persona-multiplexer/commit/b8b71fcb9b7497f51cc1defa11c33237d147e8c9))
+
 ## [0.2.0](https://github.com/gmoben/hermes-persona-multiplexer/compare/v0.1.0...v0.2.0) (2026-05-31)
 
 

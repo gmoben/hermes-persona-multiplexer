@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-persona-multiplexer"
-version = "0.2.0"
+version = "0.3.0"
 description = "One Hermes brain, many Discord faces — a multi-account Discord platform plugin for Hermes Agent."
 readme = "README.md"
 license = { text = "MIT" }
