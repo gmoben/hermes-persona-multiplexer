@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.0](https://github.com/gmoben/hermes-persona-multiplexer/compare/v0.1.0...v0.2.0) (2026-05-31)
+
+
+### ⚠ BREAKING CHANGES
+
+* plugin renamed discord-personas -> hermes-persona-multiplexer; update plugins.enabled accordingly. Plugin modules moved from the discord_personas/ subpackage to the repository root.
+
+### Features
+
+* flatten to canonical layout and rename to hermes-persona-multiplexer ([a512fe5](https://github.com/gmoben/hermes-persona-multiplexer/commit/a512fe5c883a9d669795bf46932f135099d07ee3))
+
 ## 0.1.0 (2026-05-31)
 
 
