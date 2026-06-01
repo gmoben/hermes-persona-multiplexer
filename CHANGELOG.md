@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.0](https://github.com/gmoben/hermes-persona-multiplexer/compare/v0.4.3...v0.5.0) (2026-06-01)
+
+
+### Features
+
+* compose the bundled Discord adapter + opt-in user allowlist ([#11](https://github.com/gmoben/hermes-persona-multiplexer/issues/11)) ([ffa6d2d](https://github.com/gmoben/hermes-persona-multiplexer/commit/ffa6d2d5285eca8cf9c92139a07a3e0d6aaf2748))
+* opt-in user allowlist (DISCORD_PERSONAS_ALLOWED_USERS) ([#13](https://github.com/gmoben/hermes-persona-multiplexer/issues/13)) ([5b7feea](https://github.com/gmoben/hermes-persona-multiplexer/commit/5b7feea26de07eaef6fce641ec6da9a571d4e8bb))
+
+
+### Documentation
+
+* refresh README + dev docs for the composition architecture ([#14](https://github.com/gmoben/hermes-persona-multiplexer/issues/14)) ([f6d5b38](https://github.com/gmoben/hermes-persona-multiplexer/commit/f6d5b388a5075aef50a1bcb1be702962c8bbecd0))
+
 ## [0.4.3](https://github.com/gmoben/hermes-persona-multiplexer/compare/v0.4.2...v0.4.3) (2026-05-31)
 
 
