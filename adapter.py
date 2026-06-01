@@ -1,17 +1,28 @@
 """Hermes gateway wiring for the persona multiplexer.
 
-Connects the pure decision logic in :mod:`routing` and :mod:`locks` to the
-Hermes gateway and ``discord.py``.
+Connects the pure decision logic in :mod:`routing` to the Hermes gateway by
+**composing the bundled Discord adapter** rather than re-implementing it. One
+real ``DiscordAdapter`` *delegate* runs per persona/bot token, so every native
+Discord behavior — inbound attachment caching (images, audio, documents, voice),
+history backfill, message chunking/formatting, rate-limit handling, native file
+uploads — is inherited for free. This module is a thin **router**:
 
-It runs **N Discord clients in one process** (one per persona/bot token), tags
-every inbound event with the persona whose account received it, and forwards all
-of them to the single gateway runner — i.e. one shared-brain agent. The persona
-is conveyed to the agent per-message via ``channel_prompt`` (an ephemeral system
-prompt) and the persona is encoded into the session ``chat_id`` so outbound
-replies route back through the originating persona's client.
+* one platform (``discord_personas``) is registered with the gateway;
+* each delegate's inbound is re-tagged with the persona whose bot account
+  received it (persona encoded into the session ``chat_id``, an ephemeral
+  ``channel_prompt`` telling the brain which face it wears) and forwarded to the
+  single shared-brain agent;
+* outbound calls decode the persona from the ``chat_id`` and delegate to that
+  persona's adapter, so replies/attachments/typing come from the right face.
 
-Both ``discord.py`` and Hermes imports are guarded so this module stays
-importable (for unit-testing the pure core) on machines without either.
+The only built-in behavior we override is the delegate's ``on_message`` channel
+gating: the bundled adapter routes ``@mentions`` to individual bots, whereas our
+orchestrator intakes the shared channel and routes via ``[persona:]`` tags. We
+keep the delegate's event-builder (``_handle_message``) so attachment caching and
+dedup still apply.
+
+``discord.py``, Hermes, and the bundled Discord adapter imports are all guarded so
+this module stays importable (for unit-testing the pure core) without them.
 """
 
 from __future__ import annotations
@@ -20,7 +31,6 @@ import asyncio
 import logging
 import os
 
-from .locks import ScopedLockManager
 from .routing import (
     PLATFORM_NAME,
     MultiplexerConfig,
@@ -45,11 +55,9 @@ try:  # pragma: no cover - exercised only inside a Hermes install
     from gateway.config import Platform, PlatformConfig
     from gateway.platforms.base import (
         BasePlatformAdapter,
-        MessageEvent,
-        MessageType,
+        MessageEvent,  # noqa: F401  (re-exported for tests/back-compat)
+        MessageType,  # noqa: F401
         SendResult,
-        cache_image_from_bytes,
-        cache_image_from_url,
     )
 
     _HERMES_AVAILABLE = True
@@ -65,6 +73,14 @@ except Exception:  # noqa: BLE001
                 "(gateway.platforms.base could not be imported)."
             )
 
+try:  # pragma: no cover - bundled Discord adapter is only present in a Hermes install
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    _DELEGATE_AVAILABLE = True
+except Exception:  # noqa: BLE001
+    DiscordAdapter = None  # type: ignore[assignment]
+    _DELEGATE_AVAILABLE = False
+
 
 # Delimiter used to namespace a persona into a Discord chat id so the persona
 # round-trips through Hermes session keys without a separate sidecar store.
@@ -72,10 +88,10 @@ except Exception:  # noqa: BLE001
 # memory — one brain, many faces.
 PERSONA_PREFIX = "p!"
 
-#: How long to wait for each persona's Discord client to reach READY.
+#: How long to wait for each persona's delegate to reach READY.
 READY_TIMEOUT_SECONDS = 30.0
 
-#: Discord hard limit on a single message.
+#: Discord hard limit on a single message (used by the standalone cron sender).
 MAX_MESSAGE_LENGTH = 2000
 
 
@@ -133,183 +149,102 @@ def shared_channel_prompt(personas, orchestrator_id: str) -> str:
 
 
 class DiscordPersonasAdapter(BasePlatformAdapter):
-    """Multiplexing Discord adapter: N bot accounts -> one shared-brain agent."""
+    """Multiplexing Discord adapter: N bundled ``DiscordAdapter`` delegates → one brain."""
+
+    #: Streaming via progressive ``edit_message`` is intentionally disabled: the
+    #: answering persona isn't known until the brain emits its ``[persona:]`` tag,
+    #: so we deliver one final tagged message (ack-then-route) rather than stream.
+    SUPPORTS_MESSAGE_EDITING = False
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform(PLATFORM_NAME))
         extra = getattr(config, "extra", None) or {}
         self.mux: MultiplexerConfig = parse_config(extra.get(PLATFORM_NAME, extra))
-        self.locks = ScopedLockManager(
-            PLATFORM_NAME,
-            acquire=_real_acquire_lock,
-            release=_real_release_lock,
-        )
-        self._clients: dict[str, discord.Client] = {}   # persona_id -> client
-        self._tasks: dict[str, asyncio.Task] = {}          # persona_id -> client.start() task
-        self._ready: dict[str, asyncio.Event] = {}         # persona_id -> READY event
-        self._own_account_ids: set[str] = set()            # bot user ids of all personas
-        self._account_to_persona: dict[str, str] = {}      # bot user id -> persona id
-        self._tokens: dict[str, str] = {}                  # persona_id -> token value
-        self._typing_tasks: dict[str, asyncio.Task] = {}   # chat_id -> typing-loop task
-        self._typing_persona: dict[str, str] = {}          # chat_id -> persona currently typing
+        self._delegates: dict[str, DiscordAdapter] = {}   # persona_id -> bundled adapter
+        self._own_account_ids: set[str] = set()             # bot user ids of all personas
         # Shared-channel only: the persona slated to deliver the reply, set from a
-        # `[next:<id>]` ack hint or a `[persona:<id>]` reply so typing follows them.
-        self._reply_persona: dict[str, str] = {}           # raw_chat_id -> persona
+        # `[next:<id>]` ack hint or a `[persona:<id>]` reply so typing + attachments follow.
+        self._reply_persona: dict[str, str] = {}            # raw_chat_id -> persona
+        self._typing_delegate: dict[str, str] = {}          # chat_id -> persona currently typing
         # Shared home channel (cron + content-led inbound); None disables channel intake.
         self._home_channel_id: str | None = (
             os.getenv("DISCORD_PERSONAS_HOME_CHANNEL", "").strip() or None
         )
 
     # -- lifecycle ---------------------------------------------------------
-    def _build_client(self, persona) -> discord.Client:
-        """Create + wire one persona's Discord client.
+    def _build_delegate(self, token: str) -> DiscordAdapter:
+        """Construct a bundled DiscordAdapter for one persona, configured lean.
 
-        Defined as a method (not an inline loop body) so ``persona`` is bound
-        per client and the event closures don't all capture the last persona.
+        Toggles (via ``PlatformConfig.extra``) keep delegates lightweight and let our
+        router own channel routing while still inheriting the native machinery:
+          * ``slash_commands`` off — no per-bot slash registration/command-sync churn;
+          * ``auto_thread`` off    — we use the shared channel, not auto-threads;
+          * ``require_mention`` off — the router (``decide_inbound``) gates the channel;
+          * ``history_backfill`` on — inherit native cold-start context backfill.
         """
-        intents = discord.Intents.default()
-        intents.message_content = True   # required to read DM/message text
-        intents.dm_messages = True
-        intents.guild_messages = True
-        client = discord.Client(
-            intents=intents,
-            allowed_mentions=discord.AllowedMentions.none(),  # never ping @everyone/roles
+        extra = {
+            "slash_commands": False,
+            "auto_thread": False,
+            "require_mention": False,
+            "history_backfill": True,
+        }
+        cfg = PlatformConfig(
+            enabled=True,
+            token=token,
+            reply_to_mode=getattr(self.config, "reply_to_mode", "first"),
+            extra=extra,
         )
-        ready = self._ready[persona.id]
-        adapter = self
-        pid = persona.id
-
-        @client.event
-        async def on_ready():  # noqa: ANN202 - discord callback
-            if client.user is not None:
-                adapter._own_account_ids.add(str(client.user.id))
-                adapter._account_to_persona[str(client.user.id)] = pid
-            logger.info("[%s] persona '%s' ready as %s", PLATFORM_NAME, pid, client.user)
-            ready.set()
-
-        @client.event
-        async def on_message(message):  # noqa: ANN001, ANN202 - discord callback
-            # Loop guard #1: our own / sibling persona bots (decide_inbound
-            # re-checks via own_account_ids once all personas are READY).
-            if client.user is not None and message.author.id == client.user.id:
-                return
-            if str(message.author.id) in adapter._own_account_ids:
-                return
-            # Only ordinary text + replies (skip system messages, joins, pins…).
-            if getattr(message, "type", None) not in (
-                discord.MessageType.default,
-                discord.MessageType.reply,
-            ):
-                return
-            is_dm = isinstance(message.channel, discord.DMChannel)
-            guild = getattr(message, "guild", None)
-            # Make mentions of our own personas readable to the brain
-            # (`<@123>` -> `@Label`) so it can honor explicit address in-channel.
-            text = message.content or ""
-            for um in getattr(message, "mentions", None) or []:
-                mapped = adapter._account_to_persona.get(str(getattr(um, "id", "")))
-                if mapped:
-                    label = (
-                        adapter.mux.persona(mapped).label if adapter.mux.has(mapped) else mapped
-                    )
-                    text = text.replace(f"<@{um.id}>", f"@{label}").replace(
-                        f"<@!{um.id}>", f"@{label}"
-                    )
-            # Cache image attachments to local paths so the brain can see them
-            # (vision). Without this, photos (e.g. a meal snapshot) are dropped.
-            media_urls: list[str] = []
-            media_types: list[str] = []
-            for att in getattr(message, "attachments", None) or []:
-                ctype = getattr(att, "content_type", None) or ""
-                if not ctype.startswith("image/"):
-                    continue
-                ext = "." + ctype.split("/")[-1].split(";")[0]
-                if ext not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
-                    ext = ".jpg"
-                try:
-                    media_urls.append(await adapter._cache_image(att, ext))
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("[%s] image cache failed (%s); using URL", PLATFORM_NAME, exc)
-                    media_urls.append(att.url)
-                media_types.append(ctype)
-            await adapter._on_inbound(
-                recipient_persona=pid,
-                author_account_id=str(message.author.id),
-                raw_chat_id=str(message.channel.id),
-                text=text,
-                message_id=str(message.id),
-                chat_type="dm" if is_dm else "group",
-                chat_name=(
-                    message.author.name
-                    if is_dm
-                    else getattr(message.channel, "name", str(message.channel.id))
-                ),
-                user_name=getattr(message.author, "display_name", None)
-                or getattr(message.author, "name", None),
-                guild_id=str(guild.id) if guild else None,
-                is_bot=bool(getattr(message.author, "bot", False)),
-                media_urls=media_urls,
-                media_types=media_types,
-            )
-
-        return client
-
-    async def _cache_image(self, att, ext: str) -> str:  # pragma: no cover - needs live env
-        """Download an image attachment to the local cache; return its path.
-
-        Mirrors the bundled Discord adapter: prefer the raw bytes (att.read), fall
-        back to the CDN URL (SSRF-gated by Hermes's cache_image_from_url).
-        """
-        try:
-            raw = await att.read()
-            return cache_image_from_bytes(raw, ext=ext)
-        except Exception:  # noqa: BLE001
-            return await cache_image_from_url(att.url, ext=ext)
+        return DiscordAdapter(cfg)
 
     async def connect(self) -> bool:  # pragma: no cover - needs live env
-        """Start one Discord client per persona; degrade per-persona on failure."""
+        """Start one bundled Discord delegate per persona; degrade per-persona on failure."""
         if not _DISCORD_AVAILABLE:
             logger.error("[%s] discord.py is not installed", PLATFORM_NAME)
             return False
+        if not _DELEGATE_AVAILABLE:
+            logger.error("[%s] bundled Discord adapter (plugins.platforms.discord) unavailable",
+                         PLATFORM_NAME)
+            return False
 
+        online: list[str] = []
+        degraded: list[str] = []
         for persona in self.mux.personas:
             token = os.getenv(persona.token_env, "").strip()
             if not token:
                 logger.warning("[%s] persona '%s' has no token in %s; skipping",
                                PLATFORM_NAME, persona.id, persona.token_env)
+                degraded.append(persona.id)
                 continue
-            lock = self.locks.acquire(persona.id, token)
-            if not lock.acquired:
-                logger.warning("[%s] persona '%s' degraded: %s",
-                               PLATFORM_NAME, persona.id, lock.error)
-                continue
-            self._tokens[persona.id] = token
-            self._ready[persona.id] = asyncio.Event()
-            client = self._build_client(persona)
-            self._clients[persona.id] = client
-            self._tasks[persona.id] = asyncio.create_task(client.start(token))
-
-        if not self._clients:
-            logger.error("[%s] no personas could start", PLATFORM_NAME)
-            return False
-
-        # Wait for each client's READY; personas that don't connect are degraded.
-        online: list[str] = []
-        degraded: list[str] = []
-        for pid in list(self._clients.keys()):
+            delegate = self._build_delegate(token)
+            # Route the delegate's inbound through our re-tagger (persona + chat_id).
+            delegate.set_message_handler(self._make_inbound_handler(persona.id))
             try:
-                await asyncio.wait_for(self._ready[pid].wait(), timeout=READY_TIMEOUT_SECONDS)
-                online.append(pid)
-            except TimeoutError:
-                degraded.append(pid)
-                err = self._task_error(pid)
-                logger.error("[%s] persona '%s' failed to reach READY in %.0fs%s",
-                             PLATFORM_NAME, pid, READY_TIMEOUT_SECONDS,
-                             f": {err}" if err else "")
-                await self._close_persona(pid)
+                ok = await delegate.connect()
+            except Exception as exc:  # noqa: BLE001
+                logger.error("[%s] persona '%s' connect failed: %s", PLATFORM_NAME, persona.id, exc)
+                degraded.append(persona.id)
+                continue
+            if not ok:
+                logger.warning("[%s] persona '%s' delegate did not connect",
+                               PLATFORM_NAME, persona.id)
+                degraded.append(persona.id)
+                continue
+            # Wait for READY so the bot's own account id is known (loop prevention).
+            try:
+                await asyncio.wait_for(delegate._ready_event.wait(), timeout=READY_TIMEOUT_SECONDS)
+            except (TimeoutError, AttributeError):
+                pass
+            # Replace the delegate's @mention channel-gating with our orchestrator intake
+            # (reusing its event-builder, so attachment caching + dedup still apply).
+            delegate._client.on_message = self._make_on_message(delegate)
+            self._delegates[persona.id] = delegate
+            client_user = getattr(getattr(delegate, "_client", None), "user", None)
+            if client_user is not None:
+                self._own_account_ids.add(str(client_user.id))
+            online.append(persona.id)
 
-        if not online:
-            logger.error("[%s] no personas reached READY", PLATFORM_NAME)
+        if not self._delegates:
+            logger.error("[%s] no personas could connect", PLATFORM_NAME)
             return False
 
         self._mark_connected()
@@ -317,59 +252,65 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
                     PLATFORM_NAME, tuple(online), tuple(degraded))
         return True
 
-    def _task_error(self, persona_id: str) -> str | None:
-        """Surface a client.start() failure (e.g. LoginFailure on a bad token)."""
-        task = self._tasks.get(persona_id)
-        if task is not None and task.done():
-            try:
-                exc = task.exception()
-            except (asyncio.CancelledError, asyncio.InvalidStateError):
-                return None
-            if exc is not None:
-                return f"{type(exc).__name__}: {exc}"
-        return None
+    def _make_on_message(self, delegate):  # pragma: no cover - needs live env
+        """Our minimal inbound gate, replacing the delegate's @mention channel routing.
 
-    async def _close_persona(self, persona_id: str) -> None:  # pragma: no cover - needs live env
-        client = self._clients.pop(persona_id, None)
-        task = self._tasks.pop(persona_id, None)
-        self._ready.pop(persona_id, None)
-        if client is not None:
+        We keep the delegate's event-builder (``_handle_message`` — caches attachments,
+        builds the ``MessageEvent``) but drop its multi-agent mention filtering so the
+        orchestrator can intake every shared-channel message (``decide_inbound`` then
+        decides who actually processes it).
+        """
+        async def _on_message(message):  # noqa: ANN001
             try:
-                if not client.is_closed():
-                    await client.close()
+                if delegate._dedup.is_duplicate(str(message.id)):
+                    return
+                client_user = getattr(delegate._client, "user", None)
+                if client_user is not None and message.author == client_user:
+                    return
+                if getattr(message.author, "bot", False):
+                    return  # other bots/personas — loop prevention
+                if message.type not in (discord.MessageType.default, discord.MessageType.reply):
+                    return
+                await delegate._handle_message(message)
             except Exception:  # noqa: BLE001
-                logger.debug("[%s] error closing persona '%s'", PLATFORM_NAME, persona_id)
-        if task is not None and not task.done():
-            task.cancel()
+                logger.exception("[%s] inbound handling failed", PLATFORM_NAME)
+
+        return _on_message
 
     async def disconnect(self) -> None:  # pragma: no cover - needs live env
-        for chat_id in list(self._typing_tasks.keys()):
-            await self.stop_typing(chat_id)
-        for persona_id in list(self._clients.keys()):
-            await self._close_persona(persona_id)
-        self.locks.release_all()
+        for key in list(self._typing_delegate.keys()):
+            await self.stop_typing(key)
+        for persona_id, delegate in list(self._delegates.items()):
+            try:
+                await delegate.disconnect()
+            except Exception:  # noqa: BLE001
+                logger.debug("[%s] error disconnecting persona '%s'", PLATFORM_NAME, persona_id)
+        self._delegates.clear()
         self._own_account_ids.clear()
-        self._account_to_persona.clear()
         self._reply_persona.clear()
-        self._typing_persona.clear()
+        self._typing_delegate.clear()
         self._mark_disconnected()
 
     # -- inbound -----------------------------------------------------------
-    async def _on_inbound(self, *, recipient_persona: str, author_account_id: str | None,
-                          raw_chat_id: str, text: str, message_id: str | None,
-                          chat_type: str, chat_name: str | None, user_name: str | None,
-                          guild_id: str | None = None, is_bot: bool = False,
-                          media_urls: list[str] | None = None,
-                          media_types: list[str] | None = None):
-        """Normalize a Discord message into a persona-tagged ``MessageEvent``.
+    def _make_inbound_handler(self, persona_id: str):
+        """Bind a delegate's message handler to our re-tagger for ``persona_id``."""
+        async def _handler(event):
+            return await self._dispatch_inbound(persona_id, event)
 
-        Loop prevention + persona resolution live in the pure core
-        (``tests/test_routing.py``); this just wires Discord -> Hermes.
+        return _handler
+
+    async def _dispatch_inbound(self, persona_id: str, event):
+        """Re-tag a delegate-built event with its persona and forward to the brain.
+
+        Loop prevention + orchestrator/channel routing live in the pure core
+        (``tests/test_routing.py``); this wires the delegate's event to Hermes.
         """
-        is_dm = chat_type == "dm"
+        src = event.source
+        raw_chat_id = str(getattr(src, "chat_id", "") or "")
+        is_dm = getattr(src, "chat_type", None) == "dm"
         decision = decide_inbound(
-            recipient_persona=recipient_persona,
-            author_account_id=author_account_id,
+            recipient_persona=persona_id,
+            author_account_id=str(getattr(src, "user_id", "") or "") or None,
             own_account_ids=self._own_account_ids,
             config=self.mux,
             is_dm=is_dm,
@@ -377,58 +318,58 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
             home_channel_id=self._home_channel_id,
         )
         if not decision.process:
-            logger.debug("[%s] dropping message (%s)", PLATFORM_NAME, decision.reason)
+            logger.debug("[%s] dropping message (%s) persona=%s",
+                         PLATFORM_NAME, decision.reason, persona_id)
             return None
 
         if not is_dm:
-            # New shared-channel turn: type as the orchestrator (who sends the ack)
-            # until the ack's `[next:]` hint names the answering persona.
+            # New shared-channel turn: typing starts on the orchestrator (who sends the
+            # ack) until a `[next:]`/`[persona:]` tag names the answering persona.
             self._reply_persona.pop(raw_chat_id, None)
 
-        persona = self.mux.persona(recipient_persona)
-        # DMs are owned by the addressed persona; shared-channel messages are
-        # intaken by the orchestrator, which classifies + routes the reply.
-        channel_prompt = (
-            persona_channel_prompt(persona.label, recipient_persona)
+        # Re-tag: namespace the session to this persona and route replies back through
+        # the router (not the delegate), and tell the brain which face it wears.
+        src.chat_id = encode_chat_id(persona_id, raw_chat_id)
+        src.platform = self.platform
+        label = self.mux.persona(persona_id).label
+        event.channel_prompt = (
+            persona_channel_prompt(label, persona_id)
             if is_dm
             else shared_channel_prompt(self.mux.personas, self.mux.orchestrator)
         )
-        source = self.build_source(  # type: ignore[attr-defined]
-            chat_id=encode_chat_id(recipient_persona, raw_chat_id),
-            chat_name=chat_name,
-            chat_type=chat_type,
-            user_id=author_account_id,
-            user_name=user_name,
-            is_bot=is_bot,
-            guild_id=guild_id,
-            message_id=message_id,
-        )
-        media_urls = media_urls or []
-        media_types = media_types or []
-        msg_type = MessageType.TEXT
-        if media_urls:
-            msg_type = getattr(MessageType, "PHOTO", MessageType.TEXT)
-        event = MessageEvent(
-            text=text,
-            message_type=msg_type,
-            source=source,
-            message_id=message_id,
-            channel_prompt=channel_prompt,
-            media_urls=media_urls,
-            media_types=media_types,
-        )
-        return await self.handle_message(event)  # type: ignore[attr-defined]
+        if self._message_handler is None:
+            return None
+        return await self._message_handler(event)
 
     # -- outbound ----------------------------------------------------------
-    async def send(self, chat_id, content, reply_to=None, metadata=None):  # pragma: no cover
-        """Route an outbound message through the correct persona's client.
+    def _persona_for_outbound(self, chat_id):
+        """Resolve ``(persona_id, raw_chat_id)`` for an outbound action on a chat.
 
-        Handles three leading/embedded tags the brain may emit:
+        In the shared home channel the *answering* persona owns the reply and any
+        attachments/typing that trail it (tracked in ``_reply_persona`` from the turn's
+        ``[next:]``/``[persona:]`` tag); a DM is owned by its addressed persona.
+        Falls back to the default persona when the resolved id isn't configured.
+        """
+        persona_id, raw_chat_id = decode_chat_id(str(chat_id))
+        if self._home_channel_id and raw_chat_id == self._home_channel_id:
+            persona_id = self._reply_persona.get(raw_chat_id, persona_id)
+        if persona_id is None or not self.mux.has(persona_id):
+            persona_id = self.mux.default_persona
+        return persona_id, raw_chat_id
+
+    def _delegate_for(self, chat_id):
+        """Return ``(delegate, raw_chat_id, persona_id)`` for an outbound chat id."""
+        persona_id, raw_chat_id = self._persona_for_outbound(chat_id)
+        return self._delegates.get(persona_id), raw_chat_id, persona_id
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):  # pragma: no cover
+        """Route an outbound message through the correct persona's delegate.
+
+        Handles the brain's leading/embedded tags:
         - `[next:<id>]` (leading) — typing hint; doesn't change who sends this message.
         - `[persona:<id>]` — which persona delivers the reply. It may appear mid-message
           when the brain bundles an orchestrator ack and the reply together; we split at
-          it so the ack goes out as the orchestrator and the reply as the persona, and
-          the tag never leaks to the user.
+          it so the ack goes out as the orchestrator and the reply as the persona.
         """
         metadata = metadata or {}
         inbound_persona, raw_chat_id = decode_chat_id(str(chat_id))
@@ -448,188 +389,107 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         reply_persona, before, after = split_reply_persona(content, self.mux.ids)
         if reply_persona:
             self._reply_persona[raw_chat_id] = reply_persona
-            # Text before the tag (e.g. a bundled orchestrator ack) is delivered by the
-            # inbound/orchestrator persona; the reply itself by the tagged persona.
             if before.strip():
-                await self._deliver(raw_chat_id, before, inbound_target)
-            return await self._deliver(raw_chat_id, after, reply_persona)
+                await self._deliver(raw_chat_id, before, inbound_target, reply_to, metadata)
+            return await self._deliver(raw_chat_id, after, reply_persona, reply_to, metadata)
 
-        return await self._deliver(raw_chat_id, content, inbound_target)
+        return await self._deliver(raw_chat_id, content, inbound_target, reply_to, metadata)
 
-    async def _deliver(self, raw_chat_id, content, persona_id):  # pragma: no cover - needs live env
-        """Send already-resolved content to a chat through a specific persona's client."""
+    async def _deliver(self, raw_chat_id, content, persona_id, reply_to=None,
+                       metadata=None):  # pragma: no cover - needs live env
+        """Send already-resolved text to a chat through a specific persona's delegate."""
         if not str(content).strip():
             return SendResult(success=True, message_id=None, raw_response={"control_only": True})
-        client = self._clients.get(persona_id)
-        if client is None:
+        delegate = self._delegates.get(persona_id)
+        if delegate is None:
             return SendResult(success=False, message_id=None,
                               error=f"persona '{persona_id}' is not online")
-        try:
-            channel = client.get_channel(int(raw_chat_id))
-            if channel is None:
-                channel = await client.fetch_channel(int(raw_chat_id))
-        except Exception as exc:  # noqa: BLE001
-            return SendResult(success=False, error=f"channel {raw_chat_id} unreachable: {exc}")
+        # The delegate handles native formatting, chunking, reply-to, and rate limits.
+        return await delegate.send(raw_chat_id, content, reply_to=reply_to, metadata=metadata)
 
-        formatted = self.format_message(content)  # type: ignore[attr-defined]
-        chunks = self.truncate_message(formatted, MAX_MESSAGE_LENGTH)  # type: ignore[attr-defined]
-        message_ids: list[str] = []
-        try:
-            for chunk in chunks:
-                msg = await channel.send(content=chunk)
-                message_ids.append(str(msg.id))
-        except Exception as exc:  # noqa: BLE001
-            logger.error("[%s] send failed for persona '%s': %s", PLATFORM_NAME, persona_id, exc)
-            return SendResult(success=False, error=str(exc),
-                              raw_response={"sent": message_ids, "persona": persona_id})
-        return SendResult(success=True,
-                          message_id=message_ids[0] if message_ids else None,
-                          raw_response={"message_ids": message_ids, "persona": persona_id})
-
-    # -- outbound attachments ----------------------------------------------
-    def _persona_for_outbound(self, chat_id):
-        """Resolve ``(persona_id, raw_chat_id)`` for an outbound action on a chat.
-
-        In the shared home channel the *answering* persona owns the reply and any
-        attachments that trail it (tracked in ``_reply_persona`` from the turn's
-        ``[next:]``/``[persona:]`` tag); a DM is owned by its addressed persona.
-        Falls back to the default persona when the resolved id isn't configured.
-        """
-        persona_id, raw_chat_id = decode_chat_id(str(chat_id))
-        if self._home_channel_id and raw_chat_id == self._home_channel_id:
-            persona_id = self._reply_persona.get(raw_chat_id, persona_id)
-        if persona_id is None or not self.mux.has(persona_id):
-            persona_id = self.mux.default_persona
-        return persona_id, raw_chat_id
-
-    async def _send_attachment(self, chat_id, file_path, caption=None,
-                               file_name=None):  # pragma: no cover - needs live env
-        """Upload a local file as a native Discord attachment via the right persona.
-
-        The brain emits ``MEDIA:<path>`` (or a bare artifact path) in its reply;
-        Hermes extracts + security-validates those and dispatches them to the
-        ``send_*`` methods below, so a file the agent produced — a CSV export, a
-        chart, a PDF — arrives as a real downloadable attachment instead of an
-        undownloadable container path. The file is sent by the same persona that
-        delivered the reply (see :meth:`_persona_for_outbound`).
-        """
-        persona_id, raw_chat_id = self._persona_for_outbound(chat_id)
-        client = self._clients.get(persona_id)
-        if client is None:
-            return SendResult(success=False, error=f"persona '{persona_id}' is not online")
-        try:
-            channel = client.get_channel(int(raw_chat_id))
-            if channel is None:
-                channel = await client.fetch_channel(int(raw_chat_id))
-        except Exception as exc:  # noqa: BLE001
-            return SendResult(success=False, error=f"channel {raw_chat_id} unreachable: {exc}")
-        caption = (caption or "").strip() or None
-        try:
-            filename = file_name or os.path.basename(file_path)
-            with open(file_path, "rb") as fh:
-                msg = await channel.send(content=caption, file=discord.File(fh, filename=filename))
-        except FileNotFoundError:
-            return SendResult(success=False, error=f"file not found: {file_path}")
-        except Exception as exc:  # noqa: BLE001
-            logger.error("[%s] attachment send failed for persona '%s': %s",
-                         PLATFORM_NAME, persona_id, exc)
-            return SendResult(success=False, error=str(exc))
-        return SendResult(success=True, message_id=str(msg.id),
-                          raw_response={"message_id": str(msg.id), "persona": persona_id})
-
+    # Native attachment + media delivery — routed to the answering persona's delegate,
+    # which uploads real discord.File attachments (CSV/PDF/image/video/audio).
     async def send_document(self, chat_id, file_path, caption=None, file_name=None,
                             reply_to=None, metadata=None):  # pragma: no cover - needs live env
-        """Deliver an arbitrary file (CSV, PDF, …) as a native attachment."""
-        return await self._send_attachment(chat_id, file_path, caption, file_name)
+        d, raw, pid = self._delegate_for(chat_id)
+        if d is None:
+            return SendResult(success=False, error=f"persona '{pid}' is not online")
+        return await d.send_document(raw, file_path, caption=caption, file_name=file_name,
+                                     reply_to=reply_to, metadata=metadata)
 
     async def send_image_file(self, chat_id, image_path, caption=None, reply_to=None,
                               metadata=None, **kwargs):  # pragma: no cover - needs live env
-        """Deliver a local image file; Discord renders attachments inline."""
-        return await self._send_attachment(chat_id, image_path, caption)
+        d, raw, pid = self._delegate_for(chat_id)
+        if d is None:
+            return SendResult(success=False, error=f"persona '{pid}' is not online")
+        return await d.send_image_file(raw, image_path, caption=caption, reply_to=reply_to,
+                                       metadata=metadata, **kwargs)
+
+    async def send_image(self, chat_id, image_url, caption=None, reply_to=None,
+                         metadata=None):  # pragma: no cover - needs live env
+        d, raw, pid = self._delegate_for(chat_id)
+        if d is None:
+            return SendResult(success=False, error=f"persona '{pid}' is not online")
+        return await d.send_image(raw, image_url, caption=caption, reply_to=reply_to,
+                                  metadata=metadata)
+
+    async def send_multiple_images(self, chat_id, images, metadata=None,
+                                   human_delay=0.0):  # pragma: no cover - needs live env
+        d, raw, _pid = self._delegate_for(chat_id)
+        if d is None:
+            return None
+        return await d.send_multiple_images(raw, images, metadata=metadata, human_delay=human_delay)
 
     async def send_video(self, chat_id, video_path, caption=None, reply_to=None,
                          metadata=None, **kwargs):  # pragma: no cover - needs live env
-        """Deliver a local video as a native, inline-playable attachment."""
-        return await self._send_attachment(chat_id, video_path, caption)
+        d, raw, pid = self._delegate_for(chat_id)
+        if d is None:
+            return SendResult(success=False, error=f"persona '{pid}' is not online")
+        return await d.send_video(raw, video_path, caption=caption, reply_to=reply_to,
+                                  metadata=metadata, **kwargs)
 
     async def send_voice(self, chat_id, audio_path, caption=None, reply_to=None,
                         metadata=None, **kwargs):  # pragma: no cover - needs live env
-        """Deliver an audio file as an attachment (bot accounts can't post voice notes)."""
-        return await self._send_attachment(chat_id, audio_path, caption)
+        d, raw, pid = self._delegate_for(chat_id)
+        if d is None:
+            return SendResult(success=False, error=f"persona '{pid}' is not online")
+        return await d.send_voice(raw, audio_path, caption=caption, reply_to=reply_to,
+                                  metadata=metadata, **kwargs)
 
     async def get_chat_info(self, chat_id):  # pragma: no cover - needs live env
-        _, raw = decode_chat_id(str(chat_id))
-        return {"name": raw, "type": "dm"}
+        d, raw, _pid = self._delegate_for(chat_id)
+        if d is None:
+            return {"name": raw, "type": "dm"}
+        return await d.get_chat_info(raw)
 
     # -- typing indicator --------------------------------------------------
     async def send_typing(self, chat_id, metadata=None):  # pragma: no cover - needs live env
-        """Start a persistent 'typing…' indicator on the originating persona's client.
+        """Show 'typing…' as the persona slated to answer (delegate-native typing loop).
 
-        Discord's typing indicator lasts ~10s and is unreliable in DMs, so we
-        re-trigger it every 12s until ``stop_typing`` is called (the gateway
-        invokes both — start when the agent begins working, stop after the
-        reply is sent). Keyed by the persona-namespaced ``chat_id``.
+        In the shared channel the answering persona is set from a `[next:]`/`[persona:]`
+        tag; until then it's the orchestrator. When it switches mid-turn we stop the
+        previous persona's indicator and start the new one. DMs always type as the
+        addressed persona.
         """
         key = str(chat_id)
-        # Shared channel: type as the persona slated to reply once known (set from a
-        # `[next:]` ack hint or a `[persona:]` reply); until then the orchestrator —
-        # who sends the ack — is the typer. DMs always type as the addressed persona.
         persona_id, raw_chat_id = self._persona_for_outbound(key)
-        # Already showing this persona's indicator for this chat — nothing to do.
-        if self._typing_persona.get(key) == persona_id and key in self._typing_tasks:
+        if self._typing_delegate.get(key) == persona_id:
+            return  # already typing as this persona for this chat
+        prev = self._typing_delegate.get(key)
+        if prev and prev in self._delegates:
+            await self._delegates[prev].stop_typing(raw_chat_id)
+        delegate = self._delegates.get(persona_id)
+        if delegate is None:
             return
-        # First time, or the answering persona changed → (re)start on the new client.
-        if key in self._typing_tasks:
-            await self.stop_typing(key)
-        client = self._clients.get(persona_id)
-        if client is None:
-            return
-        self._typing_persona[key] = persona_id
-
-        async def _typing_loop():
-            try:
-                while True:
-                    try:
-                        route = discord.http.Route(
-                            "POST", "/channels/{channel_id}/typing", channel_id=raw_chat_id
-                        )
-                        await client.http.request(route)
-                    except asyncio.CancelledError:
-                        return
-                    except Exception as exc:  # noqa: BLE001
-                        logger.debug("[%s] typing failed for %s: %s", PLATFORM_NAME, key, exc)
-                        return
-                    await asyncio.sleep(12)
-            except asyncio.CancelledError:
-                pass
-            finally:
-                self._typing_tasks.pop(key, None)
-                self._typing_persona.pop(key, None)
-
-        self._typing_tasks[key] = asyncio.create_task(_typing_loop())
+        self._typing_delegate[key] = persona_id
+        await delegate.send_typing(raw_chat_id, metadata)
 
     async def stop_typing(self, chat_id):  # pragma: no cover - needs live env
-        self._typing_persona.pop(str(chat_id), None)
-        task = self._typing_tasks.pop(str(chat_id), None)
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-
-
-# -- lock primitives (real ones resolved lazily from Hermes) ---------------
-def _real_acquire_lock(platform: str, token: str) -> bool:  # pragma: no cover
-    from gateway.status import acquire_scoped_lock
-
-    return bool(acquire_scoped_lock(platform, token))
-
-
-def _real_release_lock(platform: str, token: str) -> None:  # pragma: no cover
-    from gateway.status import release_scoped_lock
-
-    release_scoped_lock(platform, token)
+        key = str(chat_id)
+        persona_id = self._typing_delegate.pop(key, None)
+        _, raw_chat_id = decode_chat_id(key)
+        if persona_id and persona_id in self._delegates:
+            await self._delegates[persona_id].stop_typing(raw_chat_id)
 
 
 # -- standalone (out-of-process) cron sender -------------------------------
@@ -684,7 +544,7 @@ def register(ctx):
         name=PLATFORM_NAME,
         label="Discord Personas",
         adapter_factory=lambda cfg: DiscordPersonasAdapter(cfg),
-        check_fn=lambda: _HERMES_AVAILABLE and _DISCORD_AVAILABLE,
+        check_fn=lambda: _HERMES_AVAILABLE and _DISCORD_AVAILABLE and _DELEGATE_AVAILABLE,
         platform_hint=(
             "You speak through multiple Discord bot identities that share this one "
             "brain and memory. Each incoming message's channel prompt names which "

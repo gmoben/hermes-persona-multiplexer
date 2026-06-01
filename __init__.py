@@ -2,13 +2,16 @@
 
 A Hermes Agent ``kind: platform`` plugin that connects N Discord bot accounts
 through a single gateway process into one shared-brain agent, selecting the
-persona by which bot account received the message.
+persona by which bot account received the message. It runs one bundled
+``DiscordAdapter`` delegate per persona and routes between them, so native
+Discord behavior (attachments, backfill, formatting) is inherited rather than
+re-implemented.
 
-The package is split so the decision logic (``routing``, ``locks``) has no
-Hermes/discord dependency and is unit-testable, while ``adapter`` holds the live
-gateway wiring. This is the canonical flat plugin layout: Hermes loads the plugin
-*directory* as a package, so the modules import each other relatively. The
-``except ImportError`` fallback below only fires when this file is imported
+The package is split so the decision logic (``routing``) has no Hermes/discord
+dependency and is unit-testable, while ``adapter`` holds the live gateway wiring
++ delegate composition. This is the canonical flat plugin layout: Hermes loads
+the plugin *directory* as a package, so the modules import each other relatively.
+The ``except ImportError`` fallback below only fires when this file is imported
 standalone (e.g. pytest collecting it directly), where there's no parent package.
 """
 
