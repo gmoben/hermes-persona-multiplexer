@@ -62,6 +62,33 @@ def test_parse_config_errors(raw, msg):
     assert msg in str(exc.value)
 
 
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("1, 2  3", {"1", "2", "3"}),
+        ("217770140723445760", {"217770140723445760"}),
+        ("", set()),
+        (None, set()),
+    ],
+)
+def test_parse_allowed_users(raw, expected):
+    assert r.parse_allowed_users(raw) == frozenset(expected)
+
+
+@pytest.mark.parametrize(
+    "author, allowed, expected",
+    [
+        ("1", [], True),            # empty allowlist -> open
+        ("1", ["1", "2"], True),    # listed
+        ("9", ["1", "2"], False),   # not listed
+        (None, ["1"], False),       # missing author with an allowlist -> deny
+        (None, [], True),           # no allowlist -> open even if author unknown
+    ],
+)
+def test_is_allowed_user(author, allowed, expected):
+    assert r.is_allowed_user(author, allowed) is expected
+
+
 def test_is_self_authored():
     assert r.is_self_authored("42", ["1", "42"]) is True
     assert r.is_self_authored("99", ["1", "42"]) is False
