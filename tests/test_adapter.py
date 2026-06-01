@@ -52,6 +52,7 @@ def _make_router(own=(), home=None):  # bypass BasePlatformAdapter.__init__
     ad._chat_persona = {}
     ad._delegates = {}
     ad._orig = {}
+    ad._allowed_users = frozenset()  # open by default
     ad.platform = "discord_personas"
     ad.handled = []
 
@@ -105,6 +106,20 @@ def test_dispatch_inbound_unknown_persona_dropped():
     ad = _make_router()
     asyncio.run(ad._dispatch_inbound("ghost", _event()))
     assert ad.handled == []
+
+
+def test_dispatch_inbound_allowlist_blocks_other_users():
+    ad = _make_router()
+    ad._allowed_users = frozenset({"217770140723445760"})  # only Ben
+    asyncio.run(ad._dispatch_inbound("alex", _event(user_id="999")))  # someone else
+    assert ad.handled == []
+
+
+def test_dispatch_inbound_allowlist_admits_listed_user():
+    ad = _make_router()
+    ad._allowed_users = frozenset({"217770140723445760"})
+    asyncio.run(ad._dispatch_inbound("alex", _event(user_id="217770140723445760")))
+    assert len(ad.handled) == 1
 
 
 # ── shared-channel intake ───────────────────────────────────────────────────

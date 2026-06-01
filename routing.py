@@ -174,6 +174,26 @@ def is_self_authored(author_account_id: str | None, own_account_ids: Iterable[st
     return str(author_account_id) in {str(a) for a in own_account_ids if a is not None}
 
 
+def parse_allowed_users(raw: str | None) -> frozenset[str]:
+    """Parse a comma/whitespace-separated allowlist of platform user ids."""
+    if not raw:
+        return frozenset()
+    return frozenset(tok for tok in re.split(r"[,\s]+", str(raw).strip()) if tok)
+
+
+def is_allowed_user(author_account_id: str | None, allowed_users: Iterable[str]) -> bool:
+    """Whether ``author_account_id`` may interact with the personas.
+
+    An **empty** allowlist allows everyone (restriction is opt-in — set
+    ``DISCORD_PERSONAS_ALLOWED_USERS`` to lock the crew to specific accounts). When
+    non-empty, the author's id must be listed; an unknown/missing author is denied.
+    """
+    allowed = {str(a) for a in allowed_users if a is not None}
+    if not allowed:
+        return True
+    return author_account_id is not None and str(author_account_id) in allowed
+
+
 def decide_inbound(
     *,
     recipient_persona: str,

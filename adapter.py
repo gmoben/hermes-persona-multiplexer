@@ -40,6 +40,8 @@ from .routing import (
     MultiplexerConfig,
     decide_inbound,
     extract_next_persona,
+    is_allowed_user,
+    parse_allowed_users,
     parse_config,
     should_intake_shared_channel,
     split_reply_persona,
@@ -193,6 +195,10 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         self._home_channel_id: str | None = (
             os.getenv("DISCORD_PERSONAS_HOME_CHANNEL", "").strip() or None
         )
+        # Access control: only these user ids may interact with the crew (DMs and the
+        # shared channel). Empty = open (restriction is opt-in). Set
+        # DISCORD_PERSONAS_ALLOWED_USERS="<id>,<id>" to lock it down.
+        self._allowed_users = parse_allowed_users(os.getenv("DISCORD_PERSONAS_ALLOWED_USERS"))
 
     # -- lifecycle ---------------------------------------------------------
     def _build_delegate(self, token: str) -> DiscordAdapter:
@@ -297,6 +303,8 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
                     return
                 if getattr(message.author, "bot", False):
                     return  # other bots/personas — loop prevention
+                if not is_allowed_user(str(message.author.id), self._allowed_users):
+                    return  # access control — drop before any caching/agent work
                 if message.type not in (discord.MessageType.default, discord.MessageType.reply):
                     return
                 if not isinstance(message.channel, discord.DMChannel):
@@ -347,6 +355,11 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         """
         src = event.source
         raw_chat_id = str(getattr(src, "chat_id", "") or "")
+        author_account_id = str(getattr(src, "user_id", "") or "") or None
+        if not is_allowed_user(author_account_id, self._allowed_users):
+            logger.debug("[%s] dropping message from unauthorized user %s",
+                         PLATFORM_NAME, author_account_id)
+            return None
         is_dm = getattr(src, "chat_type", None) == "dm"
         # If the delegate auto-threaded, chat_id is the new thread and parent_chat_id is
         # the home channel; gate against the parent so the thread isn't seen as "outside".
@@ -354,7 +367,7 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         effective_channel = parent_chat_id or raw_chat_id
         decision = decide_inbound(
             recipient_persona=persona_id,
-            author_account_id=str(getattr(src, "user_id", "") or "") or None,
+            author_account_id=author_account_id,
             own_account_ids=self._own_account_ids,
             config=self.mux,
             is_dm=is_dm,
