@@ -34,6 +34,7 @@ try:
         parse_config,
         persona_metadata,
         resolve_outbound_persona,
+        should_intake_shared_channel,
         split_reply_persona,
     )
 except ImportError:  # imported standalone, no parent package
@@ -49,6 +50,7 @@ except ImportError:  # imported standalone, no parent package
         parse_config,
         persona_metadata,
         resolve_outbound_persona,
+        should_intake_shared_channel,
         split_reply_persona,
     )
 
@@ -65,6 +67,7 @@ __all__ = [
     "parse_config",
     "persona_metadata",
     "resolve_outbound_persona",
+    "should_intake_shared_channel",
     "split_reply_persona",
     "register",
 ]

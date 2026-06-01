@@ -119,6 +119,17 @@ def test_dispatch_inbound_channel_orchestrator_intakes():
     assert "[persona:" in ev2.channel_prompt and "[next:" in ev2.channel_prompt
 
 
+def test_dispatch_inbound_channel_thread_under_home_intakes():
+    # auto-thread: chat_id is the new thread, parent_chat_id is the home channel —
+    # gate against the parent so the orchestrator's threaded turn isn't dropped.
+    ad = _make_router(home="777")
+    ev = _Event(source=_Src(chat_id="thread-9", chat_type="thread", user_id="u1",
+                            parent_chat_id="777"), channel_prompt=None)
+    asyncio.run(ad._dispatch_inbound("alex", ev))
+    assert len(ad.handled) == 1
+    assert "[persona:" in ad.handled[0].channel_prompt  # shared (orchestrator) prompt
+
+
 def test_dispatch_inbound_channel_non_orchestrator_dropped():
     ad = _make_router(home="777")
     asyncio.run(ad._dispatch_inbound("sam", _event(chat_id="777", chat_type="group")))

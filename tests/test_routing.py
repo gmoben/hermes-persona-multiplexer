@@ -183,6 +183,22 @@ def test_decide_inbound_channel_still_skips_own_accounts():
 
 
 @pytest.mark.parametrize(
+    "persona, channel, parent, home, expected",
+    [
+        ("alex", "C1", None, "C1", True),    # orchestrator, home channel itself
+        ("alex", "T1", "C1", "C1", True),    # orchestrator, thread whose parent is home
+        ("sam", "C1", None, "C1", False),    # not the orchestrator -> skip (no dup thread)
+        ("alex", "C2", None, "C1", False),   # wrong channel
+        ("alex", "T1", "C2", "C1", False),   # thread under the wrong parent
+        ("alex", "C1", None, None, False),   # no home channel configured
+    ],
+)
+def test_should_intake_shared_channel(persona, channel, parent, home, expected):
+    assert r.should_intake_shared_channel(
+        persona, channel, parent, config=_cfg(), home_channel_id=home) is expected
+
+
+@pytest.mark.parametrize(
     "content, expected_persona, expected_text",
     [
         ("[persona:sam] hello", "sam", "hello"),

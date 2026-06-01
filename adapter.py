@@ -41,6 +41,7 @@ from .routing import (
     decide_inbound,
     extract_next_persona,
     parse_config,
+    should_intake_shared_channel,
     split_reply_persona,
 )
 
@@ -259,7 +260,7 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
                 pass
             # Capture native methods, then wrap inbound gating + the reply send.
             self._orig[persona.id] = {m: getattr(delegate, m) for m in _ROUTED_METHODS}
-            delegate._client.on_message = self._make_on_message(delegate)
+            delegate._client.on_message = self._make_on_message(persona.id, delegate)
             delegate.send = self._make_delegate_send(persona.id)
             self._delegates[persona.id] = delegate
             client_user = getattr(getattr(delegate, "_client", None), "user", None)
@@ -276,13 +277,15 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
                     PLATFORM_NAME, tuple(online), tuple(degraded))
         return True
 
-    def _make_on_message(self, delegate):  # pragma: no cover - needs live env
+    def _make_on_message(self, persona_id, delegate):  # pragma: no cover - needs live env
         """Our minimal inbound gate, replacing the delegate's @mention channel routing.
 
         We keep the delegate's event-builder (``_handle_message`` — caches attachments,
-        builds the ``MessageEvent``) but drop its multi-agent mention filtering so the
-        orchestrator can intake every shared-channel message (``decide_inbound`` then
-        decides who actually processes it).
+        builds the ``MessageEvent``, and auto-creates a thread if enabled) but drop its
+        multi-agent mention filtering. For a shared channel we pre-gate to the
+        orchestrator *before* ``_handle_message`` runs, so only one delegate intakes
+        (and only one thread is ever created); the orchestrator then routes the reply
+        — into that thread when threading is on — via the ``[persona:]`` tag.
         """
         async def _on_message(message):  # noqa: ANN001
             try:
@@ -295,6 +298,14 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
                     return  # other bots/personas — loop prevention
                 if message.type not in (discord.MessageType.default, discord.MessageType.reply):
                     return
+                if not isinstance(message.channel, discord.DMChannel):
+                    parent_id = getattr(message.channel, "parent_id", None)
+                    if not should_intake_shared_channel(
+                        persona_id, str(message.channel.id),
+                        str(parent_id) if parent_id else None,
+                        config=self.mux, home_channel_id=self._home_channel_id,
+                    ):
+                        return
                 await delegate._handle_message(message)
             except Exception:  # noqa: BLE001
                 logger.exception("[%s] inbound handling failed", PLATFORM_NAME)
@@ -336,13 +347,17 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         src = event.source
         raw_chat_id = str(getattr(src, "chat_id", "") or "")
         is_dm = getattr(src, "chat_type", None) == "dm"
+        # If the delegate auto-threaded, chat_id is the new thread and parent_chat_id is
+        # the home channel; gate against the parent so the thread isn't seen as "outside".
+        parent_chat_id = str(getattr(src, "parent_chat_id", "") or "")
+        effective_channel = parent_chat_id or raw_chat_id
         decision = decide_inbound(
             recipient_persona=persona_id,
             author_account_id=str(getattr(src, "user_id", "") or "") or None,
             own_account_ids=self._own_account_ids,
             config=self.mux,
             is_dm=is_dm,
-            channel_id=raw_chat_id,
+            channel_id=effective_channel,
             home_channel_id=self._home_channel_id,
         )
         if not decision.process:
