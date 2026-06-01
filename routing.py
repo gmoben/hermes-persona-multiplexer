@@ -210,6 +210,29 @@ def decide_inbound(
     return ProcessDecision(True, "ok-channel", recipient_persona)
 
 
+#: A line that is *solely* a markdown bold label ending in a colon, e.g. ``**File:**``
+#: (optionally indented / trailing space). This is what's left when an agent writes
+#: ``**File:** MEDIA:/path`` and the gateway strips the ``MEDIA:`` tag for native upload.
+_DANGLING_LABEL_RE = re.compile(r"(?m)^[ \t]*\*\*[^*\n]{1,40}:\*\*[ \t]*$\n?")
+
+
+def tidy_outbound_text(text: str) -> str:
+    """Remove a dangling markdown label left behind when a ``MEDIA:`` tag is stripped.
+
+    Agents sometimes label a file tag (``**File:** MEDIA:/path``); the gateway strips
+    the ``MEDIA:`` path to upload the file natively, leaving a value-less ``**File:**``
+    line. Drop such lone bold-label lines and collapse the blank gap. Conservative by
+    design: only a line that is *solely* a bold label ending in a colon is removed —
+    inline bold (``**Summary:** ok``), list items (``- **Item:** v``), and headings are
+    left untouched.
+    """
+    if not text or "**" not in text:
+        return text
+    cleaned = _DANGLING_LABEL_RE.sub("", text)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 def should_intake_shared_channel(
     recipient_persona: str,
     channel_id: str | None,

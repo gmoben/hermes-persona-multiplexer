@@ -36,6 +36,7 @@ try:
         resolve_outbound_persona,
         should_intake_shared_channel,
         split_reply_persona,
+        tidy_outbound_text,
     )
 except ImportError:  # imported standalone, no parent package
     from routing import (  # type: ignore[no-redef]
@@ -52,6 +53,7 @@ except ImportError:  # imported standalone, no parent package
         resolve_outbound_persona,
         should_intake_shared_channel,
         split_reply_persona,
+        tidy_outbound_text,
     )
 
 __all__ = [
@@ -69,6 +71,7 @@ __all__ = [
     "resolve_outbound_persona",
     "should_intake_shared_channel",
     "split_reply_persona",
+    "tidy_outbound_text",
     "register",
 ]
 

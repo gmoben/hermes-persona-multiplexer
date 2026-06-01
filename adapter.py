@@ -43,6 +43,7 @@ from .routing import (
     parse_config,
     should_intake_shared_channel,
     split_reply_persona,
+    tidy_outbound_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -434,7 +435,10 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
 
     async def _send_text(self, persona_id, raw_chat_id, content,
                          reply_to=None, metadata=None):  # pragma: no cover - live env
-        if not str(content).strip():
+        # Tidy artifacts left by the gateway's MEDIA: stripping (e.g. a dangling
+        # "**File:**" label) so they don't render as noise.
+        content = tidy_outbound_text(str(content))
+        if not content.strip():
             return SendResult(success=True, message_id=None, raw_response={"control_only": True})
         return await self._native(persona_id, "send", raw_chat_id, content,
                                   reply_to=reply_to, metadata=metadata)
