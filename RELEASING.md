@@ -26,10 +26,10 @@ and PATCH = fix/compat (`bump-minor-pre-major: true`,
 `bump-patch-for-minor-pre-major: false`). Because consumers pin an exact tag,
 breakage is always opt-in.
 
-**`1.0.0` criteria:** the persona-map schema is frozen, the multiplexer has run
-stably across at least one full Hermes release, and the adapter-reuse risk from
-the spike is retired. Cut it by merging a commit with `Release-As: 1.0.0` in the
-body, or a `feat!:` once you're ready for the major.
+**`1.0.0` criteria:** the persona-map schema is frozen and the composition (N
+bundled `DiscordAdapter` delegates) has run stably across at least one full Hermes
+release. Cut it by merging a commit with `Release-As: 1.0.0` in the body, or a
+`feat!:` once you're ready for the major.
 
 ## Hermes compatibility (record every release)
 
@@ -40,9 +40,9 @@ update the README compatibility matrix. `plugin.yaml` may carry a
 
 ## Cadence
 
-- `v0.1.0` is cut after the two-account spike validates (see `docs/spike.md`).
-- Let fixes accumulate into a PATCH — every merged `fix:`/`feat:` updates the
-  pending release PR; merge it when you want the release.
+- Releases are cut by merging the release-please PR — no manual tagging.
+- Let changes accumulate — every merged `fix:`/`feat:` updates the pending release
+  PR; merge it when you want the release.
 - Security fixes: merge the fix and release promptly.
 
 ## Conventional Commits → changelog sections
