@@ -210,6 +210,55 @@ def decide_inbound(
     return ProcessDecision(True, "ok-channel", recipient_persona)
 
 
+#: A line that is *solely* a markdown bold label ending in a colon, e.g. ``**File:**``
+#: (optionally indented / trailing space). This is what's left when an agent writes
+#: ``**File:** MEDIA:/path`` and the gateway strips the ``MEDIA:`` tag for native upload.
+_DANGLING_LABEL_RE = re.compile(r"(?m)^[ \t]*\*\*[^*\n]{1,40}:\*\*[ \t]*$\n?")
+
+
+def tidy_outbound_text(text: str) -> str:
+    """Remove a dangling markdown label left behind when a ``MEDIA:`` tag is stripped.
+
+    Agents sometimes label a file tag (``**File:** MEDIA:/path``); the gateway strips
+    the ``MEDIA:`` path to upload the file natively, leaving a value-less ``**File:**``
+    line. Drop such lone bold-label lines and collapse the blank gap. Conservative by
+    design: only a line that is *solely* a bold label ending in a colon is removed —
+    inline bold (``**Summary:** ok``), list items (``- **Item:** v``), and headings are
+    left untouched.
+    """
+    if not text or "**" not in text:
+        return text
+    cleaned = _DANGLING_LABEL_RE.sub("", text)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def should_intake_shared_channel(
+    recipient_persona: str,
+    channel_id: str | None,
+    parent_channel_id: str | None,
+    *,
+    config: MultiplexerConfig,
+    home_channel_id: str | None,
+) -> bool:
+    """Pre-gate for a non-DM message, applied *before* the delegate builds the event.
+
+    A shared channel is seen by every persona's bot, and the platform may auto-create
+    a thread per message — so without this gate, N delegates would each spawn a thread
+    and try to intake the same message. Only the ``orchestrator`` intakes the shared
+    channel **and its threads**, confined to the home channel (matched against the
+    message's own channel or, for a thread, its ``parent_channel_id``). DMs bypass this
+    entirely (each bot owns its own DM). Mirrors the channel half of
+    :func:`decide_inbound`, but runs early so only one delegate proceeds.
+    """
+    if recipient_persona != config.orchestrator:
+        return False
+    if not home_channel_id:
+        return False
+    home = str(home_channel_id)
+    return home in (str(channel_id or ""), str(parent_channel_id or ""))
+
+
 def _extract_leading_persona_tag(
     content: str, keyword: str, valid_ids: Iterable[str]
 ) -> tuple[str | None, str]:
