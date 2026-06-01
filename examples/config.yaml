@@ -37,6 +37,10 @@ gateway:
 # message once, the brain decides who answers, and that persona's bot delivers the
 # reply. Without a home channel set, the bots only respond to DMs.
 #
+# Each persona is a real bundled Discord adapter, so attachments (in + out), history
+# backfill, threading, formatting, and rate-limit handling work natively — no extra
+# config. DISCORD_PERSONAS_ALLOWED_USERS (below) gates who may interact; omit for open.
+#
 # ~/.hermes/.env (DO NOT COMMIT):
 #   DISCORD_TOKEN_ALEX=...
 #   DISCORD_TOKEN_SAM=...

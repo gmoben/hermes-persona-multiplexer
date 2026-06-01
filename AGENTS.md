@@ -29,7 +29,7 @@ grep TOKEN ~/.hermes/.env
 When you change the repo, **update AGENTS.md in the same commit** if you:
 
 - add/rename modules, config keys, or env vars
-- change how routing, locking, or registration works
+- change how routing, delegate composition, or registration works
 - add a new release/CI step or change the versioning workflow
 
 ## Project Overview
@@ -43,18 +43,18 @@ account. See [README.md](README.md) for the user‑facing description.
 ## Repository Structure
 
 ```
-├── __init__.py         # register() entry point + version (flat plugin root)
-├── routing.py          # PURE decision core — no Hermes/discord imports (tested)
-├── locks.py            # PURE scoped-lock manager + graceful degradation (tested)
-├── adapter.py          # Hermes/discord live wiring (connect/send/typing); guarded imports
-├── conftest.py         # loads the flat package for tests (mirrors Hermes's dir loader)
-├── tests/              # pytest; pure core runs with zero Hermes/discord deps
+├── __init__.py          # register() entry point + version (flat plugin root)
+├── routing.py           # PURE decision core — no Hermes/discord imports (tested)
+├── adapter.py           # live wiring: composes N bundled DiscordAdapter delegates
+│                        #   + routes inbound/outbound; Hermes/discord imports guarded
+├── conftest.py          # loads the flat package for tests (mirrors Hermes's dir loader)
+├── tests/               # pytest; pure core runs with zero Hermes/discord deps
 ├── examples/config.yaml
-├── plugin.yaml         # kind: platform manifest (name: hermes-persona-multiplexer)
-├── docs/spike.md       # the two-account validation plan
+├── plugin.yaml          # kind: platform manifest (name: hermes-persona-multiplexer)
+├── docs/architecture.md # composition design + adapter-owns-send routing model
 ├── release-please-config.json + .release-please-manifest.json
-└── .github/            # workflows/ (ci.yml lint+test, release.yml release-please),
-                        #   dependabot.yml, pull_request_template.md
+└── .github/             # workflows/ (ci.yml lint+test, release.yml release-please),
+                         #   dependabot.yml, pull_request_template.md
 ```
 
 ## Build / Test / Verify
@@ -66,20 +66,24 @@ ruff check .
 ```
 
 **Always validate before committing:** `pytest` and `ruff check .` must pass.
-The live adapter (`connect`/`send`) needs a real Hermes + Discord environment and
-is verified through the spike in `docs/spike.md`, not in CI.
+The live adapter (`connect`/`send`/the delegate wiring) needs a real Hermes +
+Discord environment and is verified live (staged install), not in CI.
 
 ## Architecture Rule
 
 Keep decisions pure and I/O separate:
 
-- `routing.py` / `locks.py` — **no** `gateway.*` or `discord` imports. This is
+- `routing.py` — **no** `gateway.*` or `discord` imports (config parsing, persona
+  resolution, the `[persona:]`/`[next:]` tags, channel + allowlist gating). This is
   what lets CI test the logic with no Hermes install.
-- `adapter.py` — all Hermes/discord wiring; Hermes imports are guarded so
-  `register()` stays importable/testable.
+- `adapter.py` — all Hermes/discord wiring: it **composes the bundled
+  `DiscordAdapter`** per persona and routes between them (inbound re-tag, outbound
+  `[persona:]` routing, typing). Hermes/discord imports are guarded so `register()`
+  + the pure core stay importable/testable. Token locking is the delegate's job
+  (the bundled adapter's `discord-bot-token` scope), not ours.
 
-New behavior → put the *decision* in `routing.py` (with a test), the *I/O* in
-`adapter.py`.
+New behavior → put the *decision* in `routing.py` (with a test), the *I/O* + delegate
+wiring in `adapter.py`.
 
 ## Versioning & Releases
 
@@ -92,13 +96,13 @@ Hermes‑compatibility recording requirement are in [RELEASING.md](RELEASING.md)
 ## Commit Messages
 
 [Conventional Commits](https://www.conventionalcommits.org/). Scopes: `adapter`,
-`routing`, `locks`, `config`, `docs`, `ci`, `release`. `feat:`→minor, `fix:`→patch,
+`routing`, `config`, `docs`, `ci`, `release`. `feat:`→minor, `fix:`→patch,
 `feat!:`/`BREAKING CHANGE:`→major (pre‑1.0: minor=breaking, patch=fix).
 
 ## Code Style
 
 - `#!/usr/bin/env python3`; format/lint with `ruff` (line length 100).
 - `snake_case` functions, `PascalCase` classes, `UPPER_CASE` constants.
-- Prefer stdlib; the routing/lock core must stay dependency‑free.
+- Prefer stdlib; the routing core must stay dependency‑free.
 - Adapter handlers must degrade, never crash the gateway (one bad token disables
   only that persona).
