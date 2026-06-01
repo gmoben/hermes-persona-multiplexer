@@ -5,21 +5,25 @@ Connects the pure decision logic in :mod:`routing` to the Hermes gateway by
 real ``DiscordAdapter`` *delegate* runs per persona/bot token, so every native
 Discord behavior — inbound attachment caching (images, audio, documents, voice),
 history backfill, message chunking/formatting, rate-limit handling, native file
-uploads — is inherited for free. This module is a thin **router**:
+uploads, typing — is inherited for free. This module is a thin **router**.
 
-* one platform (``discord_personas``) is registered with the gateway;
-* each delegate's inbound is re-tagged with the persona whose bot account
-  received it (persona encoded into the session ``chat_id``, an ephemeral
-  ``channel_prompt`` telling the brain which face it wears) and forwarded to the
-  single shared-brain agent;
-* outbound calls decode the persona from the ``chat_id`` and delegate to that
-  persona's adapter, so replies/attachments/typing come from the right face.
+The key constraint is that a Hermes adapter *owns sending its own reply*:
+``delegate.handle_message()`` builds the session key, asks our handler for the
+response, then sends it itself via ``delegate.send(event.source.chat_id)``. So we
+do **not** rewrite the chat id; instead:
 
-The only built-in behavior we override is the delegate's ``on_message`` channel
-gating: the bundled adapter routes ``@mentions`` to individual bots, whereas our
-orchestrator intakes the shared channel and routes via ``[persona:]`` tags. We
-keep the delegate's event-builder (``_handle_message``) so attachment caching and
-dedup still apply.
+* each delegate's inbound is gated + given a persona ``channel_prompt`` (re-tag),
+  then handed to the one shared-brain agent;
+* we alias each delegate's ``platform`` to this router's (``discord_personas``)
+  so the gateway routes *gateway-initiated* outbound (media, typing, cron) to the
+  router, which forwards to the right persona's delegate;
+* we wrap each delegate's ``send`` so the brain's ``[persona:]``/``[next:]`` tags
+  route the reply (and the orchestrator's bundled ack) to the answering persona's
+  delegate — the delegate then delivers it natively.
+
+The only built-in behavior we replace is the delegate's ``on_message`` channel
+gating (bundled @mention routing → our orchestrator intake), reusing its
+event-builder ``_handle_message`` so attachment caching + dedup still apply.
 
 ``discord.py``, Hermes, and the bundled Discord adapter imports are all guarded so
 this module stays importable (for unit-testing the pure core) without them.
@@ -37,7 +41,6 @@ from .routing import (
     decide_inbound,
     extract_next_persona,
     parse_config,
-    resolve_outbound_persona,
     split_reply_persona,
 )
 
@@ -55,7 +58,7 @@ try:  # pragma: no cover - exercised only inside a Hermes install
     from gateway.config import Platform, PlatformConfig
     from gateway.platforms.base import (
         BasePlatformAdapter,
-        MessageEvent,  # noqa: F401  (re-exported for tests/back-compat)
+        MessageEvent,  # noqa: F401  (re-exported for back-compat)
         MessageType,  # noqa: F401
         SendResult,
     )
@@ -73,6 +76,15 @@ except Exception:  # noqa: BLE001
                 "(gateway.platforms.base could not be imported)."
             )
 
+    class SendResult:  # type: ignore[no-redef]
+        """Minimal stand-in so the module imports without Hermes (tests/CI)."""
+
+        def __init__(self, success=True, message_id=None, error=None, raw_response=None):
+            self.success = success
+            self.message_id = message_id
+            self.error = error
+            self.raw_response = raw_response
+
 try:  # pragma: no cover - bundled Discord adapter is only present in a Hermes install
     from plugins.platforms.discord.adapter import DiscordAdapter
 
@@ -82,10 +94,10 @@ except Exception:  # noqa: BLE001
     _DELEGATE_AVAILABLE = False
 
 
-# Delimiter used to namespace a persona into a Discord chat id so the persona
-# round-trips through Hermes session keys without a separate sidecar store.
-# Each persona DM/channel becomes its own session, but they share the profile's
-# memory — one brain, many faces.
+# Delimiter used to namespace a persona into a chat id. Inbound replies are sent
+# by the delegate itself with the raw chat id, so we no longer encode inbound
+# events — but cron ``--deliver`` targets and tests still use this form, and the
+# router decodes it to pick a persona.
 PERSONA_PREFIX = "p!"
 
 #: How long to wait for each persona's delegate to reach READY.
@@ -93,6 +105,12 @@ READY_TIMEOUT_SECONDS = 30.0
 
 #: Discord hard limit on a single message (used by the standalone cron sender).
 MAX_MESSAGE_LENGTH = 2000
+
+#: Delegate send/media/typing methods the router captures (native) + re-routes.
+_ROUTED_METHODS = (
+    "send", "send_document", "send_image_file", "send_image",
+    "send_multiple_images", "send_video", "send_voice", "send_typing", "stop_typing",
+)
 
 
 def encode_chat_id(persona_id: str, raw_chat_id: str) -> str:
@@ -161,10 +179,13 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         extra = getattr(config, "extra", None) or {}
         self.mux: MultiplexerConfig = parse_config(extra.get(PLATFORM_NAME, extra))
         self._delegates: dict[str, DiscordAdapter] = {}   # persona_id -> bundled adapter
-        self._own_account_ids: set[str] = set()             # bot user ids of all personas
-        # Shared-channel only: the persona slated to deliver the reply, set from a
-        # `[next:<id>]` ack hint or a `[persona:<id>]` reply so typing + attachments follow.
-        self._reply_persona: dict[str, str] = {}            # raw_chat_id -> persona
+        self._orig: dict[str, dict] = {}                   # persona_id -> {method: native fn}
+        self._own_account_ids: set[str] = set()            # bot user ids of all personas
+        # Which persona owns a chat: DMs are owned by the addressed persona (set on
+        # inbound); the shared channel's *answering* persona is set from a turn's
+        # `[next:]`/`[persona:]` tag (so media + typing follow the reply).
+        self._chat_persona: dict[str, str] = {}             # raw_chat_id -> owning persona (DM)
+        self._reply_persona: dict[str, str] = {}            # raw_chat_id -> answering persona
         self._typing_delegate: dict[str, str] = {}          # chat_id -> persona currently typing
         # Shared home channel (cron + content-led inbound); None disables channel intake.
         self._home_channel_id: str | None = (
@@ -216,7 +237,10 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
                 degraded.append(persona.id)
                 continue
             delegate = self._build_delegate(token)
-            # Route the delegate's inbound through our re-tagger (persona + chat_id).
+            # Gateway-initiated outbound (media, typing, cron) is keyed by platform;
+            # alias the delegate onto the router so it routes here, and so session
+            # keys are consistent across personas + cron.
+            delegate.platform = self.platform
             delegate.set_message_handler(self._make_inbound_handler(persona.id))
             try:
                 ok = await delegate.connect()
@@ -229,14 +253,14 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
                                PLATFORM_NAME, persona.id)
                 degraded.append(persona.id)
                 continue
-            # Wait for READY so the bot's own account id is known (loop prevention).
             try:
                 await asyncio.wait_for(delegate._ready_event.wait(), timeout=READY_TIMEOUT_SECONDS)
             except (TimeoutError, AttributeError):
                 pass
-            # Replace the delegate's @mention channel-gating with our orchestrator intake
-            # (reusing its event-builder, so attachment caching + dedup still apply).
+            # Capture native methods, then wrap inbound gating + the reply send.
+            self._orig[persona.id] = {m: getattr(delegate, m) for m in _ROUTED_METHODS}
             delegate._client.on_message = self._make_on_message(delegate)
+            delegate.send = self._make_delegate_send(persona.id)
             self._delegates[persona.id] = delegate
             client_user = getattr(getattr(delegate, "_client", None), "user", None)
             if client_user is not None:
@@ -286,7 +310,9 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
             except Exception:  # noqa: BLE001
                 logger.debug("[%s] error disconnecting persona '%s'", PLATFORM_NAME, persona_id)
         self._delegates.clear()
+        self._orig.clear()
         self._own_account_ids.clear()
+        self._chat_persona.clear()
         self._reply_persona.clear()
         self._typing_delegate.clear()
         self._mark_disconnected()
@@ -300,10 +326,12 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         return _handler
 
     async def _dispatch_inbound(self, persona_id: str, event):
-        """Re-tag a delegate-built event with its persona and forward to the brain.
+        """Gate a delegate-built event + tell the brain which face to wear.
 
-        Loop prevention + orchestrator/channel routing live in the pure core
-        (``tests/test_routing.py``); this wires the delegate's event to Hermes.
+        The delegate sends its own reply (adapter-owns-send), so we do NOT rewrite the
+        chat id; we just gate (orchestrator/channel routing lives in the pure core,
+        ``tests/test_routing.py``) and stamp the persona ``channel_prompt``. Outbound
+        persona routing happens in the wrapped ``send`` + the router's media/typing.
         """
         src = event.source
         raw_chat_id = str(getattr(src, "chat_id", "") or "")
@@ -322,15 +350,14 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
                          PLATFORM_NAME, decision.reason, persona_id)
             return None
 
-        if not is_dm:
+        if is_dm:
+            # The addressed persona owns this DM — used to route media/typing back.
+            self._chat_persona[raw_chat_id] = persona_id
+        else:
             # New shared-channel turn: typing starts on the orchestrator (who sends the
             # ack) until a `[next:]`/`[persona:]` tag names the answering persona.
             self._reply_persona.pop(raw_chat_id, None)
 
-        # Re-tag: namespace the session to this persona and route replies back through
-        # the router (not the delegate), and tell the brain which face it wears.
-        src.chat_id = encode_chat_id(persona_id, raw_chat_id)
-        src.platform = self.platform
         label = self.mux.persona(persona_id).label
         event.channel_prompt = (
             persona_channel_prompt(label, persona_id)
@@ -341,155 +368,140 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
             return None
         return await self._message_handler(event)
 
-    # -- outbound ----------------------------------------------------------
+    # -- outbound routing --------------------------------------------------
     def _persona_for_outbound(self, chat_id):
-        """Resolve ``(persona_id, raw_chat_id)`` for an outbound action on a chat.
+        """Resolve ``(persona_id, raw_chat_id)`` for a gateway-initiated outbound action.
 
-        In the shared home channel the *answering* persona owns the reply and any
-        attachments/typing that trail it (tracked in ``_reply_persona`` from the turn's
-        ``[next:]``/``[persona:]`` tag); a DM is owned by its addressed persona.
-        Falls back to the default persona when the resolved id isn't configured.
+        Priority: an explicit persona encoded in the chat id (cron) → the shared
+        channel's current answering persona (``_reply_persona``) → the DM's owning
+        persona (``_chat_persona``) → the default persona.
         """
-        persona_id, raw_chat_id = decode_chat_id(str(chat_id))
-        if self._home_channel_id and raw_chat_id == self._home_channel_id:
-            persona_id = self._reply_persona.get(raw_chat_id, persona_id)
-        if persona_id is None or not self.mux.has(persona_id):
-            persona_id = self.mux.default_persona
-        return persona_id, raw_chat_id
+        hint, raw = decode_chat_id(str(chat_id))
+        if hint and self.mux.has(hint):
+            return hint, raw
+        persona = self._reply_persona.get(raw) or self._chat_persona.get(raw)
+        if not persona or not self.mux.has(persona):
+            persona = self.mux.default_persona
+        return persona, raw
 
-    def _delegate_for(self, chat_id):
-        """Return ``(delegate, raw_chat_id, persona_id)`` for an outbound chat id."""
-        persona_id, raw_chat_id = self._persona_for_outbound(chat_id)
-        return self._delegates.get(persona_id), raw_chat_id, persona_id
+    async def _native(self, persona_id, method, *args, **kwargs):  # pragma: no cover - live env
+        """Invoke a persona delegate's *native* (un-wrapped) send/media/typing method."""
+        methods = self._orig.get(persona_id)
+        if not methods or method not in methods:
+            return SendResult(success=False, error=f"persona '{persona_id}' is not online")
+        return await methods[method](*args, **kwargs)
 
-    async def send(self, chat_id, content, reply_to=None, metadata=None):  # pragma: no cover
-        """Route an outbound message through the correct persona's delegate.
+    async def _route_send(self, chat_id, content, fallback_persona,
+                          reply_to=None, metadata=None):  # pragma: no cover - live env
+        """Deliver text, honoring the brain's `[next:]`/`[persona:]` tags.
 
-        Handles the brain's leading/embedded tags:
-        - `[next:<id>]` (leading) — typing hint; doesn't change who sends this message.
-        - `[persona:<id>]` — which persona delivers the reply. It may appear mid-message
-          when the brain bundles an orchestrator ack and the reply together; we split at
-          it so the ack goes out as the orchestrator and the reply as the persona.
+        ``[next:<id>]`` (leading) only switches the typing indicator. ``[persona:<id>]``
+        chooses who delivers the reply and may appear mid-message when the brain bundles
+        an orchestrator ack with the reply — the ack goes out as ``fallback_persona``
+        (the orchestrator), the reply as the tagged persona.
         """
-        metadata = metadata or {}
-        inbound_persona, raw_chat_id = decode_chat_id(str(chat_id))
+        hint, raw = decode_chat_id(str(chat_id))
+        source = hint if (hint and self.mux.has(hint)) else fallback_persona
         content = str(content)
 
         next_persona, content = extract_next_persona(content, self.mux.ids)
         if next_persona:
-            self._reply_persona[raw_chat_id] = next_persona
-            await self.send_typing(str(chat_id))
-
-        try:
-            inbound_target = resolve_outbound_persona(
-                explicit=metadata.get("persona"), inbound=inbound_persona, config=self.mux)
-        except KeyError as exc:
-            return SendResult(success=False, error=str(exc))
+            self._reply_persona[raw] = next_persona
+            await self.send_typing(raw)
 
         reply_persona, before, after = split_reply_persona(content, self.mux.ids)
         if reply_persona:
-            self._reply_persona[raw_chat_id] = reply_persona
+            self._reply_persona[raw] = reply_persona
             if before.strip():
-                await self._deliver(raw_chat_id, before, inbound_target, reply_to, metadata)
-            return await self._deliver(raw_chat_id, after, reply_persona, reply_to, metadata)
+                await self._send_text(source, raw, before, reply_to, metadata)
+            return await self._send_text(reply_persona, raw, after, reply_to, metadata)
+        return await self._send_text(source, raw, content, reply_to, metadata)
 
-        return await self._deliver(raw_chat_id, content, inbound_target, reply_to, metadata)
-
-    async def _deliver(self, raw_chat_id, content, persona_id, reply_to=None,
-                       metadata=None):  # pragma: no cover - needs live env
-        """Send already-resolved text to a chat through a specific persona's delegate."""
+    async def _send_text(self, persona_id, raw_chat_id, content,
+                         reply_to=None, metadata=None):  # pragma: no cover - live env
         if not str(content).strip():
             return SendResult(success=True, message_id=None, raw_response={"control_only": True})
-        delegate = self._delegates.get(persona_id)
-        if delegate is None:
-            return SendResult(success=False, message_id=None,
-                              error=f"persona '{persona_id}' is not online")
-        # The delegate handles native formatting, chunking, reply-to, and rate limits.
-        return await delegate.send(raw_chat_id, content, reply_to=reply_to, metadata=metadata)
+        return await self._native(persona_id, "send", raw_chat_id, content,
+                                  reply_to=reply_to, metadata=metadata)
 
-    # Native attachment + media delivery — routed to the answering persona's delegate,
-    # which uploads real discord.File attachments (CSV/PDF/image/video/audio).
+    def _make_delegate_send(self, source_pid):  # pragma: no cover - needs live env
+        """Wrap a delegate's ``send`` so its own reply honors persona-routing tags.
+
+        The bundled ``handle_message`` delivers the agent's reply via ``self.send`` with
+        the raw chat id; we intercept here to split the `[persona:]` tag and route to
+        the answering persona's native send.
+        """
+        async def _send(chat_id, content, reply_to=None, metadata=None):  # noqa: ANN001
+            return await self._route_send(chat_id, content, source_pid, reply_to, metadata)
+
+        return _send
+
+    # Gateway-initiated outbound (media, typing, cron text) is dispatched to the
+    # router by platform; route each to the answering/owning persona's delegate.
+    async def send(self, chat_id, content, reply_to=None, metadata=None):  # pragma: no cover
+        return await self._route_send(chat_id, content, self.mux.orchestrator, reply_to, metadata)
+
     async def send_document(self, chat_id, file_path, caption=None, file_name=None,
                             reply_to=None, metadata=None):  # pragma: no cover - needs live env
-        d, raw, pid = self._delegate_for(chat_id)
-        if d is None:
-            return SendResult(success=False, error=f"persona '{pid}' is not online")
-        return await d.send_document(raw, file_path, caption=caption, file_name=file_name,
-                                     reply_to=reply_to, metadata=metadata)
+        pid, raw = self._persona_for_outbound(chat_id)
+        return await self._native(pid, "send_document", raw, file_path, caption=caption,
+                                  file_name=file_name, reply_to=reply_to, metadata=metadata)
 
     async def send_image_file(self, chat_id, image_path, caption=None, reply_to=None,
                               metadata=None, **kwargs):  # pragma: no cover - needs live env
-        d, raw, pid = self._delegate_for(chat_id)
-        if d is None:
-            return SendResult(success=False, error=f"persona '{pid}' is not online")
-        return await d.send_image_file(raw, image_path, caption=caption, reply_to=reply_to,
-                                       metadata=metadata, **kwargs)
+        pid, raw = self._persona_for_outbound(chat_id)
+        return await self._native(pid, "send_image_file", raw, image_path, caption=caption,
+                                  reply_to=reply_to, metadata=metadata, **kwargs)
 
     async def send_image(self, chat_id, image_url, caption=None, reply_to=None,
                          metadata=None):  # pragma: no cover - needs live env
-        d, raw, pid = self._delegate_for(chat_id)
-        if d is None:
-            return SendResult(success=False, error=f"persona '{pid}' is not online")
-        return await d.send_image(raw, image_url, caption=caption, reply_to=reply_to,
-                                  metadata=metadata)
+        pid, raw = self._persona_for_outbound(chat_id)
+        return await self._native(pid, "send_image", raw, image_url, caption=caption,
+                                  reply_to=reply_to, metadata=metadata)
 
     async def send_multiple_images(self, chat_id, images, metadata=None,
                                    human_delay=0.0):  # pragma: no cover - needs live env
-        d, raw, _pid = self._delegate_for(chat_id)
-        if d is None:
-            return None
-        return await d.send_multiple_images(raw, images, metadata=metadata, human_delay=human_delay)
+        pid, raw = self._persona_for_outbound(chat_id)
+        return await self._native(pid, "send_multiple_images", raw, images,
+                                  metadata=metadata, human_delay=human_delay)
 
     async def send_video(self, chat_id, video_path, caption=None, reply_to=None,
                          metadata=None, **kwargs):  # pragma: no cover - needs live env
-        d, raw, pid = self._delegate_for(chat_id)
-        if d is None:
-            return SendResult(success=False, error=f"persona '{pid}' is not online")
-        return await d.send_video(raw, video_path, caption=caption, reply_to=reply_to,
-                                  metadata=metadata, **kwargs)
+        pid, raw = self._persona_for_outbound(chat_id)
+        return await self._native(pid, "send_video", raw, video_path, caption=caption,
+                                  reply_to=reply_to, metadata=metadata, **kwargs)
 
     async def send_voice(self, chat_id, audio_path, caption=None, reply_to=None,
                         metadata=None, **kwargs):  # pragma: no cover - needs live env
-        d, raw, pid = self._delegate_for(chat_id)
-        if d is None:
-            return SendResult(success=False, error=f"persona '{pid}' is not online")
-        return await d.send_voice(raw, audio_path, caption=caption, reply_to=reply_to,
-                                  metadata=metadata, **kwargs)
+        pid, raw = self._persona_for_outbound(chat_id)
+        return await self._native(pid, "send_voice", raw, audio_path, caption=caption,
+                                  reply_to=reply_to, metadata=metadata, **kwargs)
 
     async def get_chat_info(self, chat_id):  # pragma: no cover - needs live env
-        d, raw, _pid = self._delegate_for(chat_id)
-        if d is None:
+        pid, raw = self._persona_for_outbound(chat_id)
+        methods = self._orig.get(pid)
+        if not methods:
             return {"name": raw, "type": "dm"}
-        return await d.get_chat_info(raw)
+        delegate = self._delegates.get(pid)
+        return await delegate.get_chat_info(raw)
 
-    # -- typing indicator --------------------------------------------------
+    # -- typing indicator (follows the answering persona) ------------------
     async def send_typing(self, chat_id, metadata=None):  # pragma: no cover - needs live env
-        """Show 'typing…' as the persona slated to answer (delegate-native typing loop).
-
-        In the shared channel the answering persona is set from a `[next:]`/`[persona:]`
-        tag; until then it's the orchestrator. When it switches mid-turn we stop the
-        previous persona's indicator and start the new one. DMs always type as the
-        addressed persona.
-        """
-        key = str(chat_id)
-        persona_id, raw_chat_id = self._persona_for_outbound(key)
-        if self._typing_delegate.get(key) == persona_id:
-            return  # already typing as this persona for this chat
-        prev = self._typing_delegate.get(key)
-        if prev and prev in self._delegates:
-            await self._delegates[prev].stop_typing(raw_chat_id)
-        delegate = self._delegates.get(persona_id)
-        if delegate is None:
+        pid, raw = self._persona_for_outbound(chat_id)
+        key = str(raw)
+        if self._typing_delegate.get(key) == pid:
             return
-        self._typing_delegate[key] = persona_id
-        await delegate.send_typing(raw_chat_id, metadata)
+        prev = self._typing_delegate.get(key)
+        if prev and prev in self._orig:
+            await self._native(prev, "stop_typing", raw)
+        self._typing_delegate[key] = pid
+        await self._native(pid, "send_typing", raw, metadata)
 
     async def stop_typing(self, chat_id):  # pragma: no cover - needs live env
-        key = str(chat_id)
-        persona_id = self._typing_delegate.pop(key, None)
-        _, raw_chat_id = decode_chat_id(key)
-        if persona_id and persona_id in self._delegates:
-            await self._delegates[persona_id].stop_typing(raw_chat_id)
+        _, raw = decode_chat_id(str(chat_id))
+        pid = self._typing_delegate.pop(str(raw), None)
+        if pid and pid in self._orig:
+            await self._native(pid, "stop_typing", raw)
 
 
 # -- standalone (out-of-process) cron sender -------------------------------
@@ -501,6 +513,8 @@ async def standalone_send(pconfig, chat_id, message, *, thread_id=None,
     """
     if not _DISCORD_AVAILABLE:
         raise RuntimeError("discord.py is not installed")
+
+    from .routing import resolve_outbound_persona
 
     extra = getattr(pconfig, "extra", None) or {}
     mux = parse_config(extra.get(PLATFORM_NAME, extra))

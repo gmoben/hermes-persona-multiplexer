@@ -1,10 +1,13 @@
-"""Tests for the router's persona-tagging + outbound resolution.
+"""Tests for the router's inbound gating + outbound persona resolution.
 
-``connect()``/``send()``/the ``send_*`` delegations need a live Hermes install
-with the bundled Discord adapter, so they're integration-validated. The pure
-wiring — ``_dispatch_inbound`` (re-tag a delegate-built event with its persona)
-and ``_persona_for_outbound`` (which persona owns an outbound action) — is
-testable by constructing the adapter via ``__new__`` and feeding it a stub event.
+``connect()`` and the actual send/media/typing delegation need a live Hermes
+install with the bundled Discord adapter, so they're integration-validated. The
+pure wiring is testable by constructing the adapter via ``__new__`` and feeding
+it a stub event:
+
+* ``_dispatch_inbound`` — gate a delegate-built event + stamp the persona prompt
+  (the delegate sends its own reply, so the chat id is left untouched);
+* ``_persona_for_outbound`` — which persona owns a gateway-initiated outbound.
 """
 
 import asyncio
@@ -46,8 +49,10 @@ def _make_router(own=(), home=None):  # bypass BasePlatformAdapter.__init__
     ad._own_account_ids = set(own)
     ad._home_channel_id = home
     ad._reply_persona = {}
+    ad._chat_persona = {}
     ad._delegates = {}
-    ad.platform = "discord_personas"  # only read as src.platform in re-tag
+    ad._orig = {}
+    ad.platform = "discord_personas"
     ad.handled = []
 
     async def _handler(event):
@@ -70,29 +75,28 @@ def test_persona_channel_prompt_names_the_persona():
     assert "voice" in prompt.lower()
 
 
-# ── inbound re-tagging (_dispatch_inbound) ──────────────────────────────────
-def test_dispatch_inbound_dm_tags_persona():
+# ── inbound gating + persona prompt (_dispatch_inbound) ─────────────────────
+def test_dispatch_inbound_dm_processes_and_prompts():
     ad = _make_router()
     ev = _event(chat_id="42", chat_type="dm")
     asyncio.run(ad._dispatch_inbound("alex", ev))
     assert len(ad.handled) == 1
     ev2 = ad.handled[0]
-    # chat_id is persona-namespaced so outbound routes back through 'alex'
-    assert ev2.source.chat_id == "p!alex!42"
-    # replies route back through the router, not the delegate
-    assert ev2.source.platform == "discord_personas"
+    # delegate owns the send, so the chat id is left untouched (NOT persona-encoded)
+    assert ev2.source.chat_id == "42"
     assert "alex" in ev2.channel_prompt.lower()
+    # DM ownership recorded so outbound media/typing route back to alex
+    assert ad._chat_persona["42"] == "alex"
 
 
-def test_dispatch_inbound_dm_uses_addressed_persona():
+def test_dispatch_inbound_dm_records_addressed_persona():
     ad = _make_router()
     asyncio.run(ad._dispatch_inbound("sam", _event(chat_id="9", chat_type="dm")))
-    assert ad.handled[0].source.chat_id == "p!sam!9"
+    assert ad._chat_persona["9"] == "sam"
 
 
 def test_dispatch_inbound_drops_own_account():
-    # author 999 is one of our own persona bots -> loop guard drops it
-    ad = _make_router(own=("999",))
+    ad = _make_router(own=("999",))  # author is one of our own persona bots
     asyncio.run(ad._dispatch_inbound("alex", _event(user_id="999")))
     assert ad.handled == []
 
@@ -110,7 +114,7 @@ def test_dispatch_inbound_channel_orchestrator_intakes():
     asyncio.run(ad._dispatch_inbound("alex", ev))  # alex == default => orchestrator
     assert len(ad.handled) == 1
     ev2 = ad.handled[0]
-    assert ev2.source.chat_id == "p!alex!777"
+    assert ev2.source.chat_id == "777"  # untouched
     # shared-channel prompt drives the ack's [next:] hint + the reply [persona:] tag
     assert "[persona:" in ev2.channel_prompt and "[next:" in ev2.channel_prompt
 
@@ -135,24 +139,24 @@ def test_decode_roundtrip():
     assert a.decode_chat_id("plain") == (None, "plain")
 
 
-# ── outbound attachment / typing persona routing ────────────────────────────
-def test_persona_for_outbound_dm_uses_decoded_persona():
+# ── outbound persona resolution (media/typing/cron) ─────────────────────────
+def test_persona_for_outbound_encoded_hint_wins():
     ad = _make_router()
-    assert ad._persona_for_outbound("p!sam!42") == ("sam", "42")
+    assert ad._persona_for_outbound("p!sam!42") == ("sam", "42")  # cron-style encoded target
 
 
 def test_persona_for_outbound_channel_prefers_answering_persona():
     ad = _make_router(home="777")
     ad._reply_persona = {"777": "sam"}  # the turn's [persona:] tag chose sam
-    # decoded id is the orchestrator (alex), but the reply — and its attachment — is sam's
-    assert ad._persona_for_outbound("p!alex!777") == ("sam", "777")
+    assert ad._persona_for_outbound("777") == ("sam", "777")
 
 
-def test_persona_for_outbound_channel_without_reply_uses_decoded():
-    ad = _make_router(home="777")
-    assert ad._persona_for_outbound("p!alex!777") == ("alex", "777")
-
-
-def test_persona_for_outbound_unknown_persona_uses_default():
+def test_persona_for_outbound_dm_uses_owning_persona():
     ad = _make_router()
-    assert ad._persona_for_outbound("p!ghost!42") == ("alex", "42")  # default_persona
+    ad._chat_persona = {"42": "sam"}  # recorded when sam's DM came in
+    assert ad._persona_for_outbound("42") == ("sam", "42")
+
+
+def test_persona_for_outbound_unknown_uses_default():
+    ad = _make_router()
+    assert ad._persona_for_outbound("42") == ("alex", "42")  # default_persona
