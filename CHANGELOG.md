@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/gmoben/hermes-persona-multiplexer/compare/v0.5.0...v0.5.1) (2026-06-11)
+
+
+### Bug Fixes
+
+* one typer per chat — intercept delegate typing through the router ([#15](https://github.com/gmoben/hermes-persona-multiplexer/issues/15)) ([deb6ca3](https://github.com/gmoben/hermes-persona-multiplexer/commit/deb6ca3deff8bf24a59da61d93bb8b6c1b035704))
+
 ## [0.5.0](https://github.com/gmoben/hermes-persona-multiplexer/compare/v0.4.3...v0.5.0) (2026-06-01)
 
 
