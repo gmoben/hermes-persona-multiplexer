@@ -265,10 +265,16 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
                 await asyncio.wait_for(delegate._ready_event.wait(), timeout=READY_TIMEOUT_SECONDS)
             except (TimeoutError, AttributeError):
                 pass
-            # Capture native methods, then wrap inbound gating + the reply send.
+            # Capture native methods, then wrap inbound gating, the reply send, and
+            # typing. Typing MUST be intercepted: the base class's _keep_typing loop
+            # re-fires `self.send_typing` every ~2s for the whole agent run, so an
+            # un-wrapped delegate would keep typing as itself (the orchestrator)
+            # alongside the [next:]-named persona — two simultaneous typers.
             self._orig[persona.id] = {m: getattr(delegate, m) for m in _ROUTED_METHODS}
             delegate._client.on_message = self._make_on_message(persona.id, delegate)
             delegate.send = self._make_delegate_send(persona.id)
+            delegate.send_typing = self._make_delegate_typing(persona.id)
+            delegate.stop_typing = self.stop_typing
             self._delegates[persona.id] = delegate
             client_user = getattr(getattr(delegate, "_client", None), "user", None)
             if client_user is not None:
@@ -409,6 +415,10 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         if hint and self.mux.has(hint):
             return hint, raw
         persona = self._reply_persona.get(raw) or self._chat_persona.get(raw)
+        if not persona and self._home_channel_id and raw == self._home_channel_id:
+            # Nothing routed yet this turn — the orchestrator owns the home channel
+            # (it authors the ack), so gateway-initiated actions start as them.
+            persona = self.mux.orchestrator
         if not persona or not self.mux.has(persona):
             persona = self.mux.default_persona
         return persona, raw
@@ -517,17 +527,53 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         delegate = self._delegates.get(pid)
         return await delegate.get_chat_info(raw)
 
-    # -- typing indicator (follows the answering persona) ------------------
-    async def send_typing(self, chat_id, metadata=None):  # pragma: no cover - needs live env
-        pid, raw = self._persona_for_outbound(chat_id)
-        key = str(raw)
-        if self._typing_delegate.get(key) == pid:
+    # -- typing indicator (single typer per chat, follows the answering persona) ----
+    async def _start_typing_as(self, persona_id, raw_chat_id,
+                               metadata=None):  # pragma: no cover - needs live env
+        """Ensure exactly one persona's typing indicator runs in a chat.
+
+        Every typing request — the gateway's, and each delegate's ~2s ``_keep_typing``
+        refresh — funnels here. Already-typing persona → no-op; a different persona
+        typing → theirs is stopped first (Discord then expires the stale indicator
+        within ~10s; there is no cancel API). Honors the gateway's typing pause
+        (e.g. while a clarify prompt is on screen).
+        """
+        key = str(raw_chat_id)
+        if key in self._typing_paused:
             return
-        prev = self._typing_delegate.get(key)
+        if self._typing_delegate.get(key) == persona_id:
+            return  # already typing as this persona for this chat
+        prev = self._typing_delegate.pop(key, None)
         if prev and prev in self._orig:
-            await self._native(prev, "stop_typing", raw)
-        self._typing_delegate[key] = pid
-        await self._native(pid, "send_typing", raw, metadata)
+            await self._native(prev, "stop_typing", raw_chat_id)
+        if persona_id not in self._orig:
+            return
+        self._typing_delegate[key] = persona_id
+        await self._native(persona_id, "send_typing", raw_chat_id, metadata)
+
+    def _make_delegate_typing(self, source_pid):
+        """Wrap a delegate's ``send_typing`` so its refreshes follow the turn's answerer.
+
+        The base class's ``_keep_typing`` re-fires ``self.send_typing`` every ~2s for
+        the whole agent run; un-intercepted, the intaking delegate (the orchestrator)
+        types as itself the entire time, alongside the persona named by ``[next:]``.
+        Resolution: answering persona (`[next:]`/`[persona:]`) → the DM's owning
+        persona → the delegate itself (it received the message, so pre-ack / DM
+        typing is correct from the first refresh).
+        """
+        async def _typing(chat_id, metadata=None):  # noqa: ANN001
+            _, raw = decode_chat_id(str(chat_id))
+            pid = self._reply_persona.get(raw) or self._chat_persona.get(raw) or source_pid
+            if not self.mux.has(pid):
+                pid = source_pid
+            await self._start_typing_as(pid, raw, metadata)
+
+        return _typing
+
+    async def send_typing(self, chat_id, metadata=None):  # pragma: no cover - needs live env
+        """Gateway-initiated typing — resolve the owning persona, start theirs."""
+        persona_id, raw_chat_id = self._persona_for_outbound(chat_id)
+        await self._start_typing_as(persona_id, raw_chat_id, metadata)
 
     async def stop_typing(self, chat_id):  # pragma: no cover - needs live env
         _, raw = decode_chat_id(str(chat_id))

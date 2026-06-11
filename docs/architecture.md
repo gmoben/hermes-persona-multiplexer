@@ -72,7 +72,11 @@ That shapes everything:
   and calls the router's `send_document` / `send_image_file` / … which route to the
   answering persona's native uploader (a real `discord.File`).
 - **Typing:** follows the answering persona (set from the turn's `[next:]`/`[persona:]`
-  tag), switching delegates mid‑turn.
+  tag), switching delegates mid‑turn. Each delegate's `send_typing` is wrapped, so
+  *every* typing request — including the base class's ~2s `_keep_typing` refreshes
+  during processing — funnels through one per‑chat state machine: exactly one persona
+  types at a time, and the orchestrator never keeps typing after handing off via
+  `[next:]`.
 
 ## Access control & safety
 
