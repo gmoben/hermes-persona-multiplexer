@@ -1,7 +1,7 @@
 name: hermes-persona-multiplexer
 label: Discord Personas
 kind: platform
-version: 0.5.0
+version: 0.5.1
 description: >
   One Hermes brain, many Discord faces. Connects N Discord bot accounts through
   a single gateway process into one shared-brain agent; the persona is chosen by

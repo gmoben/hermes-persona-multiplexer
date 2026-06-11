@@ -19,7 +19,7 @@ from __future__ import annotations
 
 # Source of truth for the package version is ``plugin.yaml``; release-please
 # keeps this literal in sync via its extra-files updater (annotation below).
-__version__ = "0.5.0"  # x-release-please-version
+__version__ = "0.5.1"  # x-release-please-version
 
 try:
     from .routing import (
