@@ -52,6 +52,8 @@ def _make_router(own=(), home=None):  # bypass BasePlatformAdapter.__init__
     ad._chat_persona = {}
     ad._delegates = {}
     ad._orig = {}
+    ad._typing_delegate = {}
+    ad._typing_paused = set()
     ad._allowed_users = frozenset()  # open by default
     ad.platform = "discord_personas"
     ad.handled = []
@@ -186,3 +188,68 @@ def test_persona_for_outbound_dm_uses_owning_persona():
 def test_persona_for_outbound_unknown_uses_default():
     ad = _make_router()
     assert ad._persona_for_outbound("42") == ("alex", "42")  # default_persona
+
+
+def test_persona_for_outbound_home_channel_falls_back_to_orchestrator():
+    # Pre-ack, nothing is routed yet — gateway-initiated typing in the home channel
+    # belongs to the orchestrator (who authors the ack), not default_persona.
+    ad = _make_router(home="777")
+    ad.mux = parse_config(
+        {
+            "brain": "main",
+            "default_persona": "alex",
+            "orchestrator": "sam",
+            "personas": [
+                {"id": "alex", "token_env": "T_ALEX"},
+                {"id": "sam", "token_env": "T_SAM"},
+            ],
+        }
+    )
+    assert ad._persona_for_outbound("777") == ("sam", "777")   # home -> orchestrator
+    assert ad._persona_for_outbound("42") == ("alex", "42")    # elsewhere -> default
+
+
+# ── delegate typing interception (the single-typer fix) ─────────────────────
+def _typing_recorder(ad):
+    calls = []
+
+    async def _rec(pid, raw, metadata=None):
+        calls.append((pid, raw))
+
+    ad._start_typing_as = _rec
+    return calls
+
+
+def test_delegate_typing_pre_ack_types_as_the_intaking_delegate():
+    # The orchestrator's _keep_typing refresh, before any [next:] tag: he is about
+    # to send the ack, so he is the correct typer.
+    ad = _make_router(home="777")
+    calls = _typing_recorder(ad)
+    asyncio.run(ad._make_delegate_typing("alex")("777"))
+    assert calls == [("alex", "777")]
+
+
+def test_delegate_typing_follows_next_tag_not_the_caller():
+    # Post-ack: the orchestrator's processing loop keeps refreshing, but the
+    # [next:]-named persona must be the (only) typer — this is the double-typing bug.
+    ad = _make_router(home="777")
+    ad._reply_persona["777"] = "sam"
+    calls = _typing_recorder(ad)
+    asyncio.run(ad._make_delegate_typing("alex")("777"))  # caller=alex, answerer=sam
+    assert calls == [("sam", "777")]
+
+
+def test_delegate_typing_dm_uses_owning_persona():
+    ad = _make_router()
+    ad._chat_persona["9"] = "sam"
+    calls = _typing_recorder(ad)
+    asyncio.run(ad._make_delegate_typing("sam")("9"))
+    assert calls == [("sam", "9")]
+
+
+def test_delegate_typing_unknown_reply_persona_falls_back_to_caller():
+    ad = _make_router(home="777")
+    ad._reply_persona["777"] = "ghost"  # not a configured persona
+    calls = _typing_recorder(ad)
+    asyncio.run(ad._make_delegate_typing("alex")("777"))
+    assert calls == [("alex", "777")]
