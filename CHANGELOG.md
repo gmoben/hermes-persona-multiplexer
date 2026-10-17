@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/gmoben/hermes-persona-multiplexer/compare/v0.5.1...v0.5.2) (2026-10-17)
+
+
+### Bug Fixes
+
+* **adapter:** support the hermes reconnect lifecycle ([acfea17](https://github.com/gmoben/hermes-persona-multiplexer/commit/acfea1729f6e4f4949a6f74b5300782789781853))
+
 ## [0.5.1](https://github.com/gmoben/hermes-persona-multiplexer/compare/v0.5.0...v0.5.1) (2026-06-11)
 
 
