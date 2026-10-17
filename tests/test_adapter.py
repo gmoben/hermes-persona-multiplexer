@@ -11,6 +11,10 @@ it a stub event:
 """
 
 import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
+import pytest
 
 from hermes_persona_multiplexer import adapter as a
 from hermes_persona_multiplexer.routing import parse_config
@@ -69,6 +73,49 @@ def _make_router(own=(), home=None):  # bypass BasePlatformAdapter.__init__
 def _event(chat_id="42", chat_type="dm", user_id="u1"):
     return _Event(source=_Src(chat_id=chat_id, chat_type=chat_type, user_id=user_id),
                   channel_prompt=None)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("is_reconnect", [False, True])
+def test_connect_supports_new_gateway_and_legacy_delegates(monkeypatch, legacy, is_reconnect):
+    ad = _make_router()
+    delegates = []
+    flags = []
+
+    def build_delegate(token):
+        if legacy:
+            async def connect():
+                flags.append(None)
+                return True
+        else:
+            async def connect(*, is_reconnect=False):
+                flags.append(is_reconnect)
+                return True
+
+        delegate = SimpleNamespace(
+            connect=connect,
+            set_message_handler=Mock(),
+            _ready_event=SimpleNamespace(wait=AsyncMock()),
+            _client=SimpleNamespace(user=SimpleNamespace(id=len(delegates))),
+            **{name: AsyncMock() for name in a._ROUTED_METHODS},
+        )
+        delegates.append(delegate)
+        return delegate
+
+    monkeypatch.setattr(a, "_DISCORD_AVAILABLE", True)
+    monkeypatch.setattr(a, "_DELEGATE_AVAILABLE", True)
+    monkeypatch.setenv("T_ALEX", "synthetic-alex")
+    monkeypatch.setenv("T_SAM", "synthetic-sam")
+    ad._build_delegate = build_delegate
+    ad._mark_connected = Mock()
+
+    assert asyncio.run(ad.connect(is_reconnect=is_reconnect))
+    assert flags == [None if legacy else is_reconnect] * 2
+    assert set(ad._delegates) == {"alex", "sam"}
+    ad._mark_connected.assert_called_once_with()
+    for delegate in delegates:
+        assert delegate.platform == "discord_personas"
+        delegate.set_message_handler.assert_called_once()
 
 
 def test_persona_channel_prompt_names_the_persona():

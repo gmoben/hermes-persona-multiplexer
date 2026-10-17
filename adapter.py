@@ -32,6 +32,7 @@ this module stays importable (for unit-testing the pure core) without them.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 
@@ -225,7 +226,7 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         )
         return DiscordAdapter(cfg)
 
-    async def connect(self) -> bool:  # pragma: no cover - needs live env
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Start one bundled Discord delegate per persona; degrade per-persona on failure."""
         if not _DISCORD_AVAILABLE:
             logger.error("[%s] discord.py is not installed", PLATFORM_NAME)
@@ -251,7 +252,12 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
             delegate.platform = self.platform
             delegate.set_message_handler(self._make_inbound_handler(persona.id))
             try:
-                ok = await delegate.connect()
+                # Newer Hermes gateways pass this flag even on cold start. Older
+                # bundled Discord adapters predate it, so inspect before forwarding.
+                kwargs = ({"is_reconnect": is_reconnect}
+                          if "is_reconnect" in inspect.signature(delegate.connect).parameters
+                          else {})
+                ok = await delegate.connect(**kwargs)
             except Exception as exc:  # noqa: BLE001
                 logger.error("[%s] persona '%s' connect failed: %s", PLATFORM_NAME, persona.id, exc)
                 degraded.append(persona.id)

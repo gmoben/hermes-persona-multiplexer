@@ -126,6 +126,9 @@ Each persona needs the **Message Content** intent. `hermes gateway restart` to a
 |---|---|---|
 | `0.5.x` | `0.15.x` | Composes the bundled `DiscordAdapter`; tracks the `BasePlatformAdapter` contract. |
 
+Hermes `0.22.x` additionally requires the `connect(is_reconnect=...)` compatibility
+fix in `adapter.py`. It also supports older delegates that only accept `connect()`.
+
 ## Design notes
 
 The plugin keeps a **pure decision core** (`routing.py` — config parsing, persona

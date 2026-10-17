@@ -81,6 +81,8 @@ Keep decisions pure and I/O separate:
   `[persona:]` routing, typing). Hermes/discord imports are guarded so `register()`
   + the pure core stay importable/testable. Token locking is the delegate's job
   (the bundled adapter's `discord-bot-token` scope), not ours.
+  `connect(*, is_reconnect=False)` accepts the current gateway contract and forwards
+  the flag only when the bundled delegate supports it (older Hermes does not).
 
 New behavior → put the *decision* in `routing.py` (with a test), the *I/O* + delegate
 wiring in `adapter.py`.
