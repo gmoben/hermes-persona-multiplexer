@@ -59,6 +59,8 @@ def _make_router(own=(), home=None):  # bypass BasePlatformAdapter.__init__
     ad._typing_delegate = {}
     ad._typing_paused = set()
     ad._allowed_users = frozenset()  # open by default
+    ad._disconnecting = False
+    ad._fatal_forwarded = False
     ad.platform = "discord_personas"
     ad.handled = []
 
@@ -99,6 +101,8 @@ def test_connect_supports_new_gateway_and_legacy_delegates(monkeypatch, legacy, 
             _client=SimpleNamespace(user=SimpleNamespace(id=len(delegates))),
             **{name: AsyncMock() for name in a._ROUTED_METHODS},
         )
+        if not legacy:
+            delegate.set_fatal_error_handler = Mock()
         delegates.append(delegate)
         return delegate
 
@@ -116,6 +120,123 @@ def test_connect_supports_new_gateway_and_legacy_delegates(monkeypatch, legacy, 
     for delegate in delegates:
         assert delegate.platform == "discord_personas"
         delegate.set_message_handler.assert_called_once()
+        if not legacy:
+            delegate.set_fatal_error_handler.assert_called_once()
+
+
+@pytest.mark.parametrize("retryable", [False, True])
+def test_delegate_fatal_error_notifies_runner_through_router(retryable):
+    ad = _make_router()
+    delegate = SimpleNamespace(
+        fatal_error_code="discord_websocket_health_stale", fatal_error_retryable=retryable,
+    )
+    ad._delegates["alex"] = delegate
+    ad._set_fatal_error = Mock()
+    ad._notify_fatal_error = AsyncMock()
+
+    asyncio.run(ad._make_delegate_fatal_error_handler("alex")(delegate))
+
+    ad._set_fatal_error.assert_called_once_with(
+        "discord_persona_failed",
+        "Discord persona 'alex' failed (discord_websocket_health_stale)",
+        retryable=True,
+    )
+    ad._notify_fatal_error.assert_awaited_once_with()
+
+
+def test_concurrent_delegate_failures_notify_runner_once():
+    ad = _make_router()
+    ad._delegates = {"alex": SimpleNamespace(), "sam": SimpleNamespace()}
+    ad._set_fatal_error = Mock()
+    ad._notify_fatal_error = AsyncMock()
+
+    async def fail():
+        await asyncio.gather(*(
+            ad._make_delegate_fatal_error_handler(pid)(delegate)
+            for pid, delegate in ad._delegates.items()
+        ))
+
+    asyncio.run(fail())
+
+    ad._set_fatal_error.assert_called_once()
+    ad._notify_fatal_error.assert_awaited_once()
+
+
+@pytest.mark.parametrize("stale,disconnecting", [(True, False), (False, True)])
+def test_delegate_fatal_error_ignored_after_replacement_or_during_teardown(stale, disconnecting):
+    ad = _make_router()
+    delegate = SimpleNamespace()
+    ad._delegates["alex"] = SimpleNamespace() if stale else delegate
+    ad._disconnecting = disconnecting
+    ad._set_fatal_error = Mock()
+    ad._notify_fatal_error = AsyncMock()
+
+    asyncio.run(ad._make_delegate_fatal_error_handler("alex")(delegate))
+
+    ad._set_fatal_error.assert_not_called()
+    ad._notify_fatal_error.assert_not_awaited()
+
+
+def test_connect_detects_delegate_failure_during_startup(monkeypatch):
+    ad = _make_router()
+    delegates = []
+
+    def build_delegate(token):
+        async def connect(*, is_reconnect=False):
+            # The first persona dies while the second is connecting.
+            if len(delegates) == 2:
+                delegates[0].has_fatal_error = True
+            return True
+
+        delegate = SimpleNamespace(
+            connect=connect, has_fatal_error=False,
+            fatal_error_code="discord_websocket_health_stale",
+            set_message_handler=Mock(), set_fatal_error_handler=Mock(),
+            _ready_event=SimpleNamespace(wait=AsyncMock()),
+            _client=SimpleNamespace(user=SimpleNamespace(id=len(delegates))),
+            **{name: AsyncMock() for name in a._ROUTED_METHODS},
+        )
+        delegates.append(delegate)
+        return delegate
+
+    monkeypatch.setattr(a, "_DISCORD_AVAILABLE", True)
+    monkeypatch.setattr(a, "_DELEGATE_AVAILABLE", True)
+    monkeypatch.setenv("T_ALEX", "synthetic-alex")
+    monkeypatch.setenv("T_SAM", "synthetic-sam")
+    ad._build_delegate = build_delegate
+    ad._set_fatal_error = Mock()
+    ad._mark_connected = Mock()
+    ad.disconnect = AsyncMock()
+
+    assert not asyncio.run(ad.connect())
+
+    ad._set_fatal_error.assert_called_once()
+    ad._mark_connected.assert_not_called()
+    ad.disconnect.assert_awaited_once()
+    for delegate in delegates:
+        delegate.set_fatal_error_handler.assert_not_called()
+
+
+def test_disconnect_detaches_delegate_failure_handlers_before_closing():
+    ad = _make_router()
+    ad._set_fatal_error = Mock()
+    ad._notify_fatal_error = AsyncMock()
+    ad._mark_disconnected = Mock()
+
+    async def close():
+        assert ad._disconnecting
+        delegate.set_fatal_error_handler.assert_called_once_with(None)
+        await ad._make_delegate_fatal_error_handler("alex")(delegate)
+
+    delegate = SimpleNamespace(set_fatal_error_handler=Mock(), disconnect=close)
+    ad._delegates["alex"] = delegate
+
+    asyncio.run(ad.disconnect())
+
+    ad._set_fatal_error.assert_not_called()
+    ad._notify_fatal_error.assert_not_awaited()
+    ad._mark_disconnected.assert_called_once()
+    assert not ad._delegates
 
 
 def test_persona_channel_prompt_names_the_persona():

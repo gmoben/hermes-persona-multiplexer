@@ -88,6 +88,12 @@ That shapes everything:
   that persona. Streaming edits are disabled (`SUPPORTS_MESSAGE_EDITING = False`)
   because the answering persona isn't known until the `[persona:]` tag — we deliver
   one final tagged message.
+- **Runtime recovery:** delegates forward fatal errors through the router's
+  gateway callback. Native liveness watchdogs may close a failed Discord client;
+  the runner must then rebuild the router and its delegates (a bad token is skipped
+  on reconnect, not promoted to a permanent crew-wide failure). Concurrent failures
+  trigger one reconnect, stale/teardown callbacks are ignored, and a delegate that
+  dies during startup fails the connection before it can be marked healthy.
 
 ## What we inherit (vs. re‑implement)
 

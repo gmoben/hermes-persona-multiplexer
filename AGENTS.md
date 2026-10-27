@@ -83,6 +83,11 @@ Keep decisions pure and I/O separate:
   (the bundled adapter's `discord-bot-token` scope), not ours.
   `connect(*, is_reconnect=False)` accepts the current gateway contract and forwards
   the flag only when the bundled delegate supports it (older Hermes does not).
+  Runtime delegate fatal-error callbacks must notify the runner through the router,
+  not the delegate (only the router owns a gateway slot). Rebuild the crew on a
+  retryable router failure; bad credentials are skipped independently on reconnect.
+  Ignore duplicate/stale callbacks and detach them before teardown. A delegate
+  dying during startup must fail the connection instead of marking it healthy.
 
 New behavior → put the *decision* in `routing.py` (with a test), the *I/O* + delegate
 wiring in `adapter.py`.

@@ -200,6 +200,8 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         # shared channel). Empty = open (restriction is opt-in). Set
         # DISCORD_PERSONAS_ALLOWED_USERS="<id>,<id>" to lock it down.
         self._allowed_users = parse_allowed_users(os.getenv("DISCORD_PERSONAS_ALLOWED_USERS"))
+        self._disconnecting = False
+        self._fatal_forwarded = False
 
     # -- lifecycle ---------------------------------------------------------
     def _build_delegate(self, token: str) -> DiscordAdapter:
@@ -228,6 +230,8 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Start one bundled Discord delegate per persona; degrade per-persona on failure."""
+        self._disconnecting = False
+        self._fatal_forwarded = False
         if not _DISCORD_AVAILABLE:
             logger.error("[%s] discord.py is not installed", PLATFORM_NAME)
             return False
@@ -291,10 +295,48 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
             logger.error("[%s] no personas could connect", PLATFORM_NAME)
             return False
 
+        # A delegate can die while the remaining personas are still connecting.
+        # Return a failed connect (the runner owns startup retries), rather than
+        # publishing a healthy router over a client the watchdog already closed.
+        for persona_id, delegate in self._delegates.items():
+            if getattr(delegate, "has_fatal_error", False):
+                self._set_delegate_failure(persona_id, delegate)
+                await self.disconnect()
+                return False
+
         self._mark_connected()
+        # Only the router is registered with the runner. Without forwarding these
+        # notifications, a native watchdog closes its client but nobody reconnects
+        # it. Wire after startup so teardown cannot race partial construction.
+        for persona_id, delegate in self._delegates.items():
+            setter = getattr(delegate, "set_fatal_error_handler", None)
+            if callable(setter):
+                setter(self._make_delegate_fatal_error_handler(persona_id))
         logger.info("[%s] online personas=%s degraded=%s",
                     PLATFORM_NAME, tuple(online), tuple(degraded))
         return True
+
+    def _set_delegate_failure(self, persona_id, delegate):
+        self._fatal_forwarded = True
+        code = getattr(delegate, "fatal_error_code", None) or "unknown"
+        # Rebuild the platform even for a non-retryable *delegate* failure: on
+        # reconnect a bad token is skipped, rather than disabling the whole crew.
+        self._set_fatal_error(
+            "discord_persona_failed", f"Discord persona '{persona_id}' failed ({code})",
+            retryable=True,
+        )
+
+    def _make_delegate_fatal_error_handler(self, persona_id):
+        async def _on_fatal(delegate):
+            if (self._disconnecting or self._fatal_forwarded
+                    or self._delegates.get(persona_id) is not delegate):
+                return
+            # Set the guard before awaiting: concurrent delegate failures must
+            # produce one runner-owned teardown/reconnect, not several.
+            self._set_delegate_failure(persona_id, delegate)
+            await self._notify_fatal_error()
+
+        return _on_fatal
 
     def _make_on_message(self, persona_id, delegate):  # pragma: no cover - needs live env
         """Our minimal inbound gate, replacing the delegate's @mention channel routing.
@@ -334,6 +376,11 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         return _on_message
 
     async def disconnect(self) -> None:  # pragma: no cover - needs live env
+        self._disconnecting = True
+        for delegate in self._delegates.values():
+            setter = getattr(delegate, "set_fatal_error_handler", None)
+            if callable(setter):
+                setter(None)
         for key in list(self._typing_delegate.keys()):
             await self.stop_typing(key)
         for persona_id, delegate in list(self._delegates.items()):
