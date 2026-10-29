@@ -75,7 +75,7 @@ the delegate's native behavior.
 pin a release, tag‑clone then install from the local path:
 
 ```bash
-git clone --branch v0.5.0 https://github.com/gmoben/hermes-persona-multiplexer.git /tmp/hpm
+git clone --branch v0.5.2 https://github.com/gmoben/hermes-persona-multiplexer.git /tmp/hpm
 hermes plugins install file:///tmp/hpm && rm -rf /tmp/hpm
 # or unpinned (tracks main): hermes plugins install gmoben/hermes-persona-multiplexer
 hermes gateway restart
@@ -124,10 +124,12 @@ Each persona needs the **Message Content** intent. `hermes gateway restart` to a
 
 | Plugin | Hermes (tested) | Notes |
 |---|---|---|
-| `0.5.x` | `0.15.x` | Composes the bundled `DiscordAdapter`; tracks the `BasePlatformAdapter` contract. |
+| `0.5.2` | `0.22.2` | Supports the `connect(is_reconnect=...)` lifecycle, rebuilds the crew after a delegate failure, and keeps intake routing independent of the gateway's builtin `DISCORD_*` defaults. Still accepts delegates that only take `connect()`. |
+| `0.5.0`–`0.5.1` | `0.15.x` | Composes the bundled `DiscordAdapter`; tracks the `BasePlatformAdapter` contract. |
 
-Hermes `0.22.x` additionally requires the `connect(is_reconnect=...)` compatibility
-fix in `adapter.py`. It also supports older delegates that only accept `connect()`.
+Use `0.5.2` or later on Hermes `0.22.x`. Earlier releases fail to connect (the
+gateway passes `is_reconnect`), never reconnect dead personas, and silently reject
+unmentioned shared-channel messages.
 
 ## Design notes
 
