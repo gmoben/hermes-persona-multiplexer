@@ -88,6 +88,19 @@ Keep decisions pure and I/O separate:
   retryable router failure; bad credentials are skipped independently on reconnect.
   Ignore duplicate/stale callbacks and detach them before teardown. A delegate
   dying during startup must fail the connection instead of marking it healthy.
+  Intake diagnostics log only persona/stage, access/routing booleans and attachment
+  counts. Never log payloads, captions, filenames, URLs, or private IDs. Preserve
+  the native socket-event callback (it refreshes liveness); duplicate deliveries
+  must invoke the delegate once and shared-channel intake belongs only to the
+  orchestrator. Connection status alone is not an inbound smoke test.
+  Native `missed_message_backfill` is disabled on every delegate: it bypasses
+  persona intake and could replay the same upload through multiple bots. This is
+  separate from `history_backfill` (read-only conversation context), which stays on.
+  Pin only the delegate's `require_mention`/`auto_thread` routing flags off at the
+  native flag resolver: gateway startup exports builtin `DISCORD_*` defaults that
+  otherwise override the delegate's `config.extra`. Do not override native access
+  gates or mutate process-global env as a workaround. Integration checks must
+  load gateway configuration first, not just the read-only YAML settings.
 
 New behavior → put the *decision* in `routing.py` (with a test), the *I/O* + delegate
 wiring in `adapter.py`.

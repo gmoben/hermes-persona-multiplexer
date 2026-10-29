@@ -11,6 +11,8 @@ it a stub event:
 """
 
 import asyncio
+import logging
+import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -237,6 +239,148 @@ def test_disconnect_detaches_delegate_failure_handlers_before_closing():
     ad._notify_fatal_error.assert_not_awaited()
     ad._mark_disconnected.assert_called_once()
     assert not ad._delegates
+
+
+def _intake_fixture(monkeypatch, *, persona="alex", is_dm=False):
+    class DMChannel:
+        id = "private-dm-fixture"
+
+    message_types = SimpleNamespace(default=object(), reply=object())
+    monkeypatch.setattr(a, "discord", SimpleNamespace(
+        DMChannel=DMChannel, MessageType=message_types,
+    ))
+    ad = _make_router(home="private-channel-fixture")
+    ad._allowed_users = frozenset({"private-user-fixture"})
+    seen = set()
+
+    def duplicate(message_id):
+        if message_id in seen:
+            return True
+        seen.add(message_id)
+        return False
+
+    delegate = SimpleNamespace(
+        _dedup=SimpleNamespace(is_duplicate=duplicate),
+        _client=SimpleNamespace(user=SimpleNamespace(id="private-bot-fixture")),
+        _handle_message=AsyncMock(return_value=True),
+    )
+    message = SimpleNamespace(
+        id="private-message-fixture",
+        author=SimpleNamespace(id="private-user-fixture", bot=False),
+        channel=DMChannel() if is_dm else SimpleNamespace(id=ad._home_channel_id),
+        type=message_types.default,
+        attachments=[SimpleNamespace(url="https://example.invalid/private-photo.jpg")],
+        content="private-caption-fixture",
+    )
+    return ad, delegate, message, ad._make_on_message(persona, delegate)
+
+
+@pytest.mark.parametrize("is_dm", [False, True])
+def test_live_intake_dispatches_duplicate_event_once(monkeypatch, caplog, is_dm):
+    ad, delegate, message, intake = _intake_fixture(monkeypatch, is_dm=is_dm)
+
+    async def deliver_twice():
+        await asyncio.gather(intake(message), intake(message))
+
+    with caplog.at_level(logging.INFO, logger=a.__name__):
+        asyncio.run(deliver_twice())
+
+    delegate._handle_message.assert_awaited_once_with(message)
+    assert "stage=delegate_dispatch" in caplog.text
+    assert "stage=duplicate" in caplog.text
+    assert "home_channel=True" in caplog.text
+    for private in [message.id, message.author.id, message.content, message.channel.id,
+                    message.attachments[0].url]:
+        assert private not in caplog.text
+
+
+def test_live_shared_channel_intake_runs_only_on_orchestrator(monkeypatch):
+    _, delegate, message, intake = _intake_fixture(monkeypatch, persona="sam")
+
+    asyncio.run(intake(message))
+
+    delegate._handle_message.assert_not_awaited()
+
+
+def test_live_intake_rejection_is_visible_without_logging_identities(monkeypatch, caplog):
+    _, delegate, message, intake = _intake_fixture(monkeypatch)
+    delegate._handle_message.return_value = False
+
+    with caplog.at_level(logging.INFO, logger=a.__name__):
+        asyncio.run(intake(message))
+
+    assert "stage=delegate_rejected" in caplog.text
+    assert message.id not in caplog.text
+    assert message.author.id not in caplog.text
+
+
+def test_socket_trace_preserves_native_liveness_callback(caplog):
+    ad = _make_router()
+    native = AsyncMock()
+    handler = ad._make_socket_event_handler("alex", native)
+
+    async def receive():
+        await handler("HEARTBEAT_ACK")
+        await handler("MESSAGE_CREATE")
+
+    with caplog.at_level(logging.INFO, logger=a.__name__):
+        asyncio.run(receive())
+
+    assert native.await_count == 2
+    native.assert_any_await("HEARTBEAT_ACK")
+    native.assert_any_await("MESSAGE_CREATE")
+    assert caplog.text.count("stage=gateway_message_create") == 1
+    assert "HEARTBEAT_ACK" not in caplog.text
+
+
+def test_delegate_disables_native_reexecution_but_keeps_history_context(monkeypatch):
+    ad = _make_router()
+    ad.config = SimpleNamespace(reply_to_mode="first")
+    monkeypatch.setattr(a, "PlatformConfig", SimpleNamespace, raising=False)
+    native = Mock()
+    monkeypatch.setattr(a, "DiscordAdapter", native)
+
+    ad._build_delegate("synthetic-not-a-credential")
+
+    cfg = native.call_args.args[0]
+    assert cfg.extra["history_backfill"] is True
+    assert cfg.extra["missed_message_backfill"] == {"enabled": False}
+
+
+def test_delegate_routing_flags_survive_gateway_exported_discord_defaults(monkeypatch):
+    ad = _make_router()
+    ad.config = SimpleNamespace(reply_to_mode="first")
+    monkeypatch.setattr(a, "PlatformConfig", SimpleNamespace, raising=False)
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+    calls = []
+
+    def native_flag(key, env_key, env_default, *, truthy):
+        calls.append(key)
+        return os.environ.get(env_key, env_default).lower() == "true"
+
+    native = SimpleNamespace(_extra_or_env_flag=native_flag)
+    monkeypatch.setattr(a, "DiscordAdapter", lambda cfg: native)
+
+    delegate = ad._build_delegate("synthetic-not-a-credential")
+
+    assert not delegate._extra_or_env_flag(
+        "require_mention", "DISCORD_REQUIRE_MENTION", "true", truthy=False,
+    )
+    assert not delegate._extra_or_env_flag(
+        "auto_thread", "DISCORD_AUTO_THREAD", "true", truthy=True,
+    )
+    # Unrelated native policy remains native; no access gate is forced open.
+    assert not delegate._extra_or_env_flag(
+        "unrelated_policy", "SYNTHETIC_UNRELATED_FLAG", "false", truthy=True,
+    )
+    monkeypatch.setenv("SYNTHETIC_UNRELATED_FLAG", "true")
+    assert delegate._extra_or_env_flag(
+        "unrelated_policy", "SYNTHETIC_UNRELATED_FLAG", "false", truthy=True,
+    )
+    assert calls == ["unrelated_policy", "unrelated_policy"]
+    assert os.environ["DISCORD_REQUIRE_MENTION"] == "true"
+    assert os.environ["DISCORD_AUTO_THREAD"] == "true"
 
 
 def test_persona_channel_prompt_names_the_persona():

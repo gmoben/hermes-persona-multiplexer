@@ -202,6 +202,11 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         self._allowed_users = parse_allowed_users(os.getenv("DISCORD_PERSONAS_ALLOWED_USERS"))
         self._disconnecting = False
         self._fatal_forwarded = False
+        logger.info(
+            "[%s] intake configured home_channel=%s allowed_users=%d orchestrator=%s",
+            PLATFORM_NAME, bool(self._home_channel_id), len(self._allowed_users),
+            self.mux.orchestrator,
+        )
 
     # -- lifecycle ---------------------------------------------------------
     def _build_delegate(self, token: str) -> DiscordAdapter:
@@ -219,6 +224,9 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
             "auto_thread": False,
             "require_mention": False,
             "history_backfill": True,
+            # Native replay bypasses our orchestrator gate. Never let all six
+            # delegates independently re-run an old upload while a user reposts.
+            "missed_message_backfill": {"enabled": False},
         }
         cfg = PlatformConfig(
             enabled=True,
@@ -226,7 +234,21 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
             reply_to_mode=getattr(self.config, "reply_to_mode", "first"),
             extra=extra,
         )
-        return DiscordAdapter(cfg)
+        delegate = DiscordAdapter(cfg)
+        native_flag = getattr(delegate, "_extra_or_env_flag", None)
+        if callable(native_flag):
+            def _routing_flag(key, env_key, env_default, *, truthy):
+                # Gateway startup exports the builtin Discord YAML defaults to
+                # DISCORD_* env vars, which newer delegates prefer over extra.
+                # These two routing choices belong to the multiplexer: its
+                # allowlist/home-channel gate already ran before native intake.
+                # Keep every other native flag, especially access control, intact.
+                if key in {"require_mention", "auto_thread"}:
+                    return False
+                return native_flag(key, env_key, env_default, truthy=truthy)
+
+            delegate._extra_or_env_flag = _routing_flag
+        return delegate
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Start one bundled Discord delegate per persona; degrade per-persona on failure."""
@@ -282,6 +304,26 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
             # alongside the [next:]-named persona — two simultaneous typers.
             self._orig[persona.id] = {m: getattr(delegate, m) for m in _ROUTED_METHODS}
             delegate._client.on_message = self._make_on_message(persona.id, delegate)
+            native_socket_handler = getattr(delegate._client, "on_socket_event_type", None)
+            if callable(native_socket_handler):
+                delegate._client.on_socket_event_type = self._make_socket_event_handler(
+                    persona.id, native_socket_handler,
+                )
+            intents = getattr(delegate._client, "intents", None)
+            logger.info(
+                "[%s] intake wired persona=%s guild_messages=%s message_content=%s",
+                PLATFORM_NAME, persona.id, getattr(intents, "guild_messages", None),
+                getattr(intents, "message_content", None),
+            )
+            require_mention = getattr(delegate, "_discord_require_mention", None)
+            if callable(require_mention):
+                logger.info(
+                    "[%s] intake policy persona=%s require_mention=%s auto_thread=%s",
+                    PLATFORM_NAME, persona.id, require_mention(),
+                    delegate._extra_or_env_flag(
+                        "auto_thread", "DISCORD_AUTO_THREAD", "true", truthy=True,
+                    ),
+                )
             delegate.send = self._make_delegate_send(persona.id)
             delegate.send_typing = self._make_delegate_typing(persona.id)
             delegate.stop_typing = self.stop_typing
@@ -338,7 +380,32 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
 
         return _on_fatal
 
-    def _make_on_message(self, persona_id, delegate):  # pragma: no cover - needs live env
+    def _make_socket_event_handler(self, persona_id, native_handler):
+        async def _on_socket_event_type(event_type):
+            # Preserve the native liveness stamp. Only the event TYPE is logged:
+            # never the gateway payload, message text, attachments, or identities.
+            await native_handler(event_type)
+            if event_type == "MESSAGE_CREATE":
+                logger.info("[%s] intake persona=%s stage=gateway_message_create",
+                            PLATFORM_NAME, persona_id)
+
+        return _on_socket_event_type
+
+    def _trace_intake(self, persona_id, message, stage):
+        if getattr(message.author, "bot", False):
+            return
+        channel = message.channel
+        effective_channel = str(getattr(channel, "parent_id", None) or channel.id)
+        logger.info(
+            "[%s] intake persona=%s stage=%s dm=%s home_channel=%s home_match=%s "
+            "allowed_user=%s attachments=%d",
+            PLATFORM_NAME, persona_id, stage, isinstance(channel, discord.DMChannel),
+            bool(self._home_channel_id), effective_channel == self._home_channel_id,
+            is_allowed_user(str(message.author.id), self._allowed_users),
+            len(getattr(message, "attachments", None) or []),
+        )
+
+    def _make_on_message(self, persona_id, delegate):
         """Our minimal inbound gate, replacing the delegate's @mention channel routing.
 
         We keep the delegate's event-builder (``_handle_message`` — caches attachments,
@@ -350,7 +417,9 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         """
         async def _on_message(message):  # noqa: ANN001
             try:
+                self._trace_intake(persona_id, message, "received")
                 if delegate._dedup.is_duplicate(str(message.id)):
+                    self._trace_intake(persona_id, message, "duplicate")
                     return
                 client_user = getattr(delegate._client, "user", None)
                 if client_user is not None and message.author == client_user:
@@ -358,8 +427,10 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
                 if getattr(message.author, "bot", False):
                     return  # other bots/personas — loop prevention
                 if not is_allowed_user(str(message.author.id), self._allowed_users):
+                    self._trace_intake(persona_id, message, "unauthorized")
                     return  # access control — drop before any caching/agent work
                 if message.type not in (discord.MessageType.default, discord.MessageType.reply):
+                    self._trace_intake(persona_id, message, "unsupported_type")
                     return
                 if not isinstance(message.channel, discord.DMChannel):
                     parent_id = getattr(message.channel, "parent_id", None)
@@ -368,8 +439,14 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
                         str(parent_id) if parent_id else None,
                         config=self.mux, home_channel_id=self._home_channel_id,
                     ):
+                        self._trace_intake(persona_id, message, "not_channel_owner")
                         return
-                await delegate._handle_message(message)
+                self._trace_intake(persona_id, message, "delegate_dispatch")
+                dispatched = await delegate._handle_message(message)
+                self._trace_intake(
+                    persona_id, message,
+                    "delegate_rejected" if dispatched is False else "delegate_returned",
+                )
             except Exception:  # noqa: BLE001
                 logger.exception("[%s] inbound handling failed", PLATFORM_NAME)
 
@@ -416,8 +493,8 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
         raw_chat_id = str(getattr(src, "chat_id", "") or "")
         author_account_id = str(getattr(src, "user_id", "") or "") or None
         if not is_allowed_user(author_account_id, self._allowed_users):
-            logger.debug("[%s] dropping message from unauthorized user %s",
-                         PLATFORM_NAME, author_account_id)
+            logger.info("[%s] intake persona=%s stage=router_unauthorized",
+                        PLATFORM_NAME, persona_id)
             return None
         is_dm = getattr(src, "chat_type", None) == "dm"
         # If the delegate auto-threaded, chat_id is the new thread and parent_chat_id is
@@ -434,8 +511,8 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
             home_channel_id=self._home_channel_id,
         )
         if not decision.process:
-            logger.debug("[%s] dropping message (%s) persona=%s",
-                         PLATFORM_NAME, decision.reason, persona_id)
+            logger.info("[%s] intake persona=%s stage=router_rejected reason=%s",
+                        PLATFORM_NAME, persona_id, decision.reason)
             return None
 
         if is_dm:
@@ -453,8 +530,14 @@ class DiscordPersonasAdapter(BasePlatformAdapter):
             else shared_channel_prompt(self.mux.personas, self.mux.orchestrator)
         )
         if self._message_handler is None:
+            logger.error("[%s] intake persona=%s stage=no_gateway_handler",
+                         PLATFORM_NAME, persona_id)
             return None
-        return await self._message_handler(event)
+        logger.info("[%s] intake persona=%s stage=brain_dispatch", PLATFORM_NAME, persona_id)
+        response = await self._message_handler(event)
+        logger.info("[%s] intake persona=%s stage=brain_returned has_response=%s",
+                    PLATFORM_NAME, persona_id, bool(response))
+        return response
 
     # -- outbound routing --------------------------------------------------
     def _persona_for_outbound(self, chat_id):

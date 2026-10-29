@@ -63,6 +63,25 @@ That shapes everything:
    prompt in the shared channel), and forwards to the gateway. The chat id is left
    raw; for an auto‑created thread the home‑channel check uses the thread's parent.
 
+Intake diagnostics distinguish `gateway_message_create`, `received`, delegate
+dispatch/rejection, and `brain_dispatch`/`brain_returned`. They record only the
+persona, stage, routing/access booleans and attachment counts: never message text,
+payloads, filenames, URLs or private IDs. The native socket-event callback still
+runs so its liveness timestamp is preserved. Confirm a real incoming upload in a
+throwaway channel/thread reaches the transcript and produces one final reply/record;
+an online status and an outbound/manual recovery reply do not prove intake works.
+Native `missed_message_backfill` (re-execution) is explicitly disabled on delegates:
+it bypasses the router's orchestrator gate and must not compete with a user's
+repost. This does not disable read-only `history_backfill` conversation context.
+
+The gateway's builtin Discord YAML-to-env bridge exports `DISCORD_REQUIRE_MENTION`
+and `DISCORD_AUTO_THREAD` defaults even when this plugin supplies the transport.
+Modern delegates prefer those env values over `config.extra`, so setting only the
+extra flags is insufficient. The router pins those two routing flags off through
+the delegate's native flag resolver; all other native flags and access controls
+are unchanged. Integration checks load gateway configuration before intake so
+this startup-dependent failure cannot be hidden by a read-only-config test.
+
 ## Outbound
 
 - **Text:** `delegate.send` (wrapped) → `_route_send` splits `[next:]`/`[persona:]`,
