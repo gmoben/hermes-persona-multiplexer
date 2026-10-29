@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.5.2](https://github.com/gmoben/hermes-persona-multiplexer/compare/v0.5.1...v0.5.2) (2026-10-29)
+
+
+### Bug Fixes
+
+* **adapter:** isolate persona intake from discord routing defaults ([3f84d93](https://github.com/gmoben/hermes-persona-multiplexer/commit/3f84d93cb78440fc837ea9db00938e9a5e41b1f7))
+* **adapter:** recover failed Discord persona connections ([e1bd24d](https://github.com/gmoben/hermes-persona-multiplexer/commit/e1bd24d9f5488eb22400e1b8061d6dbc04226bca))
+* **adapter:** support the hermes reconnect lifecycle ([acfea17](https://github.com/gmoben/hermes-persona-multiplexer/commit/acfea1729f6e4f4949a6f74b5300782789781853))
+
+
+### Documentation
+
+* record hermes 0.22.2 compatibility for v0.5.2 ([d0442ba](https://github.com/gmoben/hermes-persona-multiplexer/commit/d0442babb1f3684a561ab3d063d1e2e4bc7ff625))
+
 ## [0.5.1](https://github.com/gmoben/hermes-persona-multiplexer/compare/v0.5.0...v0.5.1) (2026-06-11)
 
 
